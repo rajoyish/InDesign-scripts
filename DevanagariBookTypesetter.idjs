@@ -1,0 +1,508 @@
+/**
+ * @file DevanagariBookTypesetter.idjs
+ * @description Modern Adobe InDesign UXP Script (.idjs) for Devanagari book typesetting.
+ *              Detects and fixes orphaned dandas (।, ॥), detached matras/viramas,
+ *              mistyped ASCII pipes, redundant ZWNJ/ZWJ joiners, and whitespace issues.
+ * @version 1.0.0
+ * @compatibility Adobe InDesign v18.0+ (UXP Scripting Engine)
+ */
+
+const { app, UndoModes, ScriptLanguage, NothingEnum } = require("indesign");
+
+// ============================================================================
+// 1. MODULAR CONFIGURATION: DEVANAGARI TYPOGRAPHIC & GREP RULES
+// ============================================================================
+// Add custom GREP or Text rules to this array without modifying core logic.
+// Each rule can contain one or more `queries` executed sequentially.
+//
+// Supported query properties:
+//   - type: "grep" | "text" (defaults to "grep")
+//   - findWhat: GREP or Text pattern to find
+//   - changeTo: Replacement pattern (or function(userPrefs) returning string)
+//   - repeatUntilZero: (boolean) Re-run query until 0 matches remain (useful for chained marks)
+// ============================================================================
+
+const DANDA_SPACING_MODES = {
+    NONBREAKING_SPACE: 0, // Replace space before ।, ॥, ?, ! with Nonbreaking Space (~S)
+    REMOVE_BEFORE_DANDA: 1, // Remove space before ।, ॥; use Nonbreaking Space (~S) before ?, !
+    THIN_NONBREAKING_SPACE: 2 // Replace space before ।, ॥, ?, ! with Thin Nonbreaking Space (~<)
+};
+
+const DEVANAGARI_RULES = [
+    {
+        id: "normalize_dandas",
+        label: "Normalize Danda Characters (| and || -> \u0964 and \u0965)",
+        description: "Converts mistyped ASCII vertical pipes into Devanagari Purnavirama and Deerghavirama.",
+        defaultEnabled: true,
+        queries: [
+            {
+                type: "grep",
+                comment: "Convert double vertical pipes (||) to Deerghavirama (॥)",
+                findWhat: "\\|\\|",
+                changeTo: "\\x{0965}"
+            },
+            {
+                type: "grep",
+                comment: "Convert single vertical pipe (|) to Purnavirama (।)",
+                findWhat: "\\|",
+                changeTo: "\\x{0964}"
+            }
+        ]
+    },
+    {
+        id: "fix_detached_matras",
+        label: "Fix Detached Matras & Signs (\u093E-\u094D, \u0902, \u0901, \u0903)",
+        description: "Removes accidental spaces before dependent vowel signs, anusvara, chandrabindu, visarga, nukta, and halant.",
+        defaultEnabled: true,
+        queries: [
+            {
+                type: "grep",
+                comment: "Strip horizontal spaces between a Devanagari char and a dependent vowel/combining mark",
+                findWhat: "([\\x{0900}-\\x{097F}])[\\h]+([\\x{0901}-\\x{0903}\\x{093A}-\\x{093C}\\x{093E}-\\x{094F}\\x{0951}-\\x{0957}\\x{0962}-\\x{0963}])",
+                changeTo: "$1$2",
+                repeatUntilZero: true
+            }
+        ]
+    },
+    {
+        id: "prevent_orphaned_dandas",
+        label: "Prevent Orphaned Dandas (\u0964, \u0965) & Punctuation (?, !)",
+        description: "Prevents Purnavirama, Deerghavirama, ?, and ! from breaking onto a new line alone.",
+        defaultEnabled: true,
+        queries: [
+            {
+                type: "grep",
+                comment: "Handle space before Purnavirama (।) and Deerghavirama (॥) based on user spacing preference",
+                findWhat: "(?<!\\r)[ \\t~>~f~|~3~4~%]+([\\x{0964}\\x{0965}])",
+                changeTo: (prefs) => {
+                    if (prefs.dandaSpacingMode === DANDA_SPACING_MODES.REMOVE_BEFORE_DANDA) {
+                        return "$1";
+                    }
+                    if (prefs.dandaSpacingMode === DANDA_SPACING_MODES.THIN_NONBREAKING_SPACE) {
+                        return "~<$1";
+                    }
+                    return "~S$1";
+                }
+            },
+            {
+                type: "grep",
+                comment: "Replace breaking spaces before ? and ! with Nonbreaking Space (~S or ~<)",
+                findWhat: "(?<!\\r)[ \\t~>~f~|~3~4~%]+([?!])",
+                changeTo: (prefs) => {
+                    return prefs.dandaSpacingMode === DANDA_SPACING_MODES.THIN_NONBREAKING_SPACE
+                        ? "~<$1"
+                        : "~S$1";
+                }
+            }
+        ]
+    },
+    {
+        id: "clean_redundant_joiners",
+        label: "Clean Redundant Joiners (Duplicate ZWNJ / ZWJ)",
+        description: "Collapses consecutive Zero Width Non-Joiners (\\u200C) and Zero Width Joiners (\\u200D).",
+        defaultEnabled: true,
+        queries: [
+            {
+                type: "grep",
+                comment: "Collapse multiple Zero Width Non-Joiners (U+200C) into one",
+                findWhat: "\\x{200C}{2,}",
+                changeTo: "\\x{200C}"
+            },
+            {
+                type: "grep",
+                comment: "Collapse multiple Zero Width Joiners (U+200D) into one",
+                findWhat: "\\x{200D}{2,}",
+                changeTo: "\\x{200D}"
+            }
+        ]
+    },
+    {
+        id: "whitespace_cleanup",
+        label: "Whitespace Cleanup (Multiple & Trailing Spaces)",
+        description: "Collapses multiple consecutive standard spaces and strips trailing spaces at paragraph ends.",
+        defaultEnabled: true,
+        queries: [
+            {
+                type: "grep",
+                comment: "Collapse 2+ consecutive standard spaces into a single space",
+                findWhat: "[ ]{2,}",
+                changeTo: " "
+            },
+            {
+                type: "grep",
+                comment: "Strip trailing horizontal whitespace at the end of paragraphs",
+                findWhat: "[\\h]+$",
+                changeTo: ""
+            }
+        ]
+    }
+];
+
+// ============================================================================
+// 2. HELPER UTILITIES (ENUMS, SCOPE DETECTION, PREFERENCE RESET)
+// ============================================================================
+
+const NOTHING = NothingEnum.NOTHING || NothingEnum.nothing;
+const UNDO_ENTIRE_SCRIPT = UndoModes.ENTIRE_SCRIPT || UndoModes.entireScript;
+const SCRIPT_LANG = ScriptLanguage.UXPSCRIPT || ScriptLanguage.JAVASCRIPT || ScriptLanguage.uxpscript;
+
+/**
+ * Safely resets both GREP and Text Find/Change preferences to NothingEnum.
+ */
+function resetFindChangePreferences() {
+    app.findGrepPreferences = NOTHING;
+    app.changeGrepPreferences = NOTHING;
+    app.findTextPreferences = NOTHING;
+    app.changeTextPreferences = NOTHING;
+}
+
+/**
+ * Inspects the active document selection and determines available target scopes.
+ * @param {Document} doc
+ * @returns {{ hasTextOrFrameSelection: boolean, canUseSelection: boolean, selectionTarget: any, storyTarget: any, docTarget: Document }}
+ */
+function detectTargetContext(doc) {
+    const selList = doc.selection;
+    const firstSel = selList && selList.length > 0 ? selList[0] : null;
+
+    if (!firstSel) {
+        return {
+            hasTextOrFrameSelection: false,
+            canUseSelection: false,
+            selectionTarget: null,
+            storyTarget: null,
+            docTarget: doc
+        };
+    }
+
+    const typeName = firstSel.constructor ? firstSel.constructor.name : "";
+    const hasParentStory = Boolean(firstSel.parentStory);
+    const isInsertionPoint = typeName === "InsertionPoint";
+    const supportsChangeGrep = typeof firstSel.changeGrep === "function";
+
+    // A selected TextFrame or highlighted Text range (Character, Word, Paragraph, Text, etc.)
+    if (hasParentStory && supportsChangeGrep && !isInsertionPoint) {
+        return {
+            hasTextOrFrameSelection: true,
+            canUseSelection: true,
+            selectionTarget: firstSel,
+            storyTarget: firstSel.parentStory,
+            docTarget: doc
+        };
+    }
+
+    // Blinking cursor (InsertionPoint) inside a story: has a parent story, but 0 chars highlighted
+    if (hasParentStory && isInsertionPoint) {
+        return {
+            hasTextOrFrameSelection: true,
+            canUseSelection: false,
+            selectionTarget: firstSel.parentStory,
+            storyTarget: firstSel.parentStory,
+            docTarget: doc
+        };
+    }
+
+    return {
+        hasTextOrFrameSelection: false,
+        canUseSelection: false,
+        selectionTarget: null,
+        storyTarget: null,
+        docTarget: doc
+    };
+}
+
+// ============================================================================
+// 3. PRE-RUN CONFIGURATION DIALOG (UXP NATIVE MODAL DIALOG)
+// ============================================================================
+
+/**
+ * Builds and displays the pre-run configuration dialog.
+ * @param {ReturnType<typeof detectTargetContext>} context
+ * @returns {null | { targetObject: any, targetLabel: string, enabledRuleIds: Set<string>, dandaSpacingMode: number }}
+ */
+function showConfigurationDialog(context) {
+    const dialog = app.dialogs.add({
+        name: "Devanagari Book Typesetter — Cleanup Configuration",
+        canCancel: true
+    });
+
+    const mainCol = dialog.dialogColumns.add();
+
+    // --- Section 1: Target Scope ---
+    const scopePanel = mainCol.borderPanels.add();
+    const scopeCol = scopePanel.dialogColumns.add();
+    scopeCol.staticTexts.add({ staticLabel: "1. Target Scope:" });
+
+    const scopeRadioGroup = scopeCol.radiobuttonGroups.add();
+    const scopeOptions = [];
+
+    if (context.hasTextOrFrameSelection) {
+        if (context.canUseSelection) {
+            scopeOptions.push({
+                label: "Selected Text / Text Frame",
+                target: context.selectionTarget
+            });
+        }
+        scopeOptions.push({
+            label: "Parent Story",
+            target: context.storyTarget
+        });
+        scopeOptions.push({
+            label: "Entire Active Document",
+            target: context.docTarget
+        });
+    } else {
+        scopeOptions.push({
+            label: "Entire Active Document (No text selection detected)",
+            target: context.docTarget
+        });
+    }
+
+    scopeOptions.forEach((opt, index) => {
+        scopeRadioGroup.radiobuttonControls.add({
+            staticLabel: opt.label,
+            checkedState: index === 0 // Defaults to Selected Text when available, else first valid option
+        });
+    });
+
+    // --- Section 2: Configurable Typographic Rules ---
+    const rulesPanel = mainCol.borderPanels.add();
+    const rulesCol = rulesPanel.dialogColumns.add();
+    rulesCol.staticTexts.add({ staticLabel: "2. Devanagari Typographic Rules:" });
+
+    const ruleCheckboxes = DEVANAGARI_RULES.map((rule) => {
+        const cb = rulesCol.checkboxControls.add({
+            staticLabel: rule.label,
+            checkedState: Boolean(rule.defaultEnabled)
+        });
+        return { id: rule.id, control: cb };
+    });
+
+    // --- Section 3: Danda Spacing Preference ---
+    const dandaPanel = mainCol.borderPanels.add();
+    const dandaCol = dandaPanel.dialogColumns.add();
+    dandaCol.staticTexts.add({
+        staticLabel: "3. Purnavirama (\u0964) & Deerghavirama (\u0965) Spacing Preference:"
+    });
+
+    const dandaRadioGroup = dandaCol.radiobuttonGroups.add();
+    dandaRadioGroup.radiobuttonControls.add({
+        staticLabel: "Replace space before \u0964, \u0965, ?, ! with Nonbreaking Space (~S)",
+        checkedState: true
+    });
+    dandaRadioGroup.radiobuttonControls.add({
+        staticLabel: "Remove space before \u0964 and \u0965 (keep Nonbreaking Space before ? and !)",
+        checkedState: false
+    });
+    dandaRadioGroup.radiobuttonControls.add({
+        staticLabel: "Use Thin Nonbreaking Space (~<) before \u0964, \u0965, ?, !",
+        checkedState: false
+    });
+
+    const userAccepted = dialog.show();
+    if (!userAccepted) {
+        dialog.destroy();
+        return null;
+    }
+
+    const selectedScopeIdx = scopeRadioGroup.selectedButton || 0;
+    const chosenScope = scopeOptions[selectedScopeIdx] || scopeOptions[0];
+    const dandaSpacingMode = dandaRadioGroup.selectedButton || 0;
+
+    const enabledRuleIds = new Set();
+    ruleCheckboxes.forEach((item) => {
+        if (item.control.checkedState) {
+            enabledRuleIds.add(item.id);
+        }
+    });
+
+    dialog.destroy();
+
+    return {
+        targetObject: chosenScope.target,
+        targetLabel: chosenScope.label,
+        enabledRuleIds,
+        dandaSpacingMode
+    };
+}
+
+// ============================================================================
+// 4. CORE EXECUTION ENGINE
+// ============================================================================
+
+/**
+ * Executes a single query object against the target scope and returns the replacement count.
+ * @param {any} target
+ * @param {object} query
+ * @param {object} userPrefs
+ * @returns {number}
+ */
+function runSingleQuery(target, query, userPrefs) {
+    const mode = (query.type || "grep").toLowerCase();
+    const resolvedChangeTo =
+        typeof query.changeTo === "function" ? query.changeTo(userPrefs) : query.changeTo;
+
+    const maxIterations = query.repeatUntilZero ? 10 : 1;
+    let queryTotal = 0;
+
+    for (let pass = 0; pass < maxIterations; pass++) {
+        resetFindChangePreferences();
+
+        let changedItems = [];
+        if (mode === "text") {
+            app.findTextPreferences.findWhat = query.findWhat;
+            app.changeTextPreferences.changeTo = resolvedChangeTo;
+            changedItems = target.changeText();
+        } else {
+            app.findGrepPreferences.findWhat = query.findWhat;
+            app.changeGrepPreferences.changeTo = resolvedChangeTo;
+            changedItems = target.changeGrep();
+        }
+
+        const passCount = changedItems ? changedItems.length : 0;
+        queryTotal += passCount;
+
+        if (passCount === 0) {
+            break;
+        }
+    }
+
+    return queryTotal;
+}
+
+/**
+ * Runs all enabled Devanagari rules and records replacement counts per rule.
+ * @param {ReturnType<typeof showConfigurationDialog>} config
+ * @returns {{ ruleResults: Array<{ id: string, label: string, count: number }>, totalFixes: number }}
+ */
+function executeRules(config) {
+    const ruleResults = [];
+    let totalFixes = 0;
+
+    try {
+        resetFindChangePreferences();
+
+        for (const rule of DEVANAGARI_RULES) {
+            if (!config.enabledRuleIds.has(rule.id)) {
+                continue;
+            }
+
+            let ruleCount = 0;
+            for (const query of rule.queries) {
+                ruleCount += runSingleQuery(config.targetObject, query, config);
+            }
+
+            ruleResults.push({
+                id: rule.id,
+                label: rule.label,
+                count: ruleCount
+            });
+            totalFixes += ruleCount;
+        }
+    } finally {
+        // Always restore clean Find/Change state even if an error is thrown
+        resetFindChangePreferences();
+    }
+
+    return { ruleResults, totalFixes };
+}
+
+// ============================================================================
+// 5. POST-RUN STATISTICS & SUMMARY DIALOG
+// ============================================================================
+
+/**
+ * Displays a modal summary report detailing replacements made per rule category.
+ * @param {string} targetLabel
+ * @param {{ ruleResults: Array<{ id: string, label: string, count: number }>, totalFixes: number }} summary
+ */
+function showSummaryDialog(targetLabel, summary) {
+    const dialog = app.dialogs.add({
+        name: "Devanagari Typesetting — Summary Report",
+        canCancel: false
+    });
+
+    const col = dialog.dialogColumns.add();
+
+    // Scope Header
+    const headerPanel = col.borderPanels.add();
+    const headerCol = headerPanel.dialogColumns.add();
+    headerCol.staticTexts.add({ staticLabel: `Scope Processed: ${targetLabel}` });
+
+    // Breakdown Table
+    const detailsPanel = col.borderPanels.add();
+    const labelCol = detailsPanel.dialogColumns.add();
+    const countCol = detailsPanel.dialogColumns.add();
+
+    labelCol.staticTexts.add({ staticLabel: "Rule Category" });
+    countCol.staticTexts.add({ staticLabel: "Replacements" });
+
+    if (summary.ruleResults.length === 0) {
+        labelCol.staticTexts.add({ staticLabel: "(No rules were enabled)" });
+        countCol.staticTexts.add({ staticLabel: "0" });
+    } else {
+        for (const item of summary.ruleResults) {
+            labelCol.staticTexts.add({ staticLabel: item.label });
+            countCol.staticTexts.add({ staticLabel: `${item.count}` });
+        }
+    }
+
+    // Total Footer
+    const totalPanel = col.borderPanels.add();
+    const totalCol = totalPanel.dialogColumns.add();
+    totalCol.staticTexts.add({
+        staticLabel: `Total Fixes Applied: ${summary.totalFixes} (Undoable in one step via Ctrl+Z / Cmd+Z)`
+    });
+
+    dialog.show();
+    dialog.destroy();
+}
+
+// ============================================================================
+// 6. MAIN ENTRY POINT
+// ============================================================================
+
+function main() {
+    if (app.documents.length === 0) {
+        const alertDialog = app.dialogs.add({
+            name: "Devanagari Book Typesetter",
+            canCancel: false
+        });
+        alertDialog.dialogColumns
+            .add()
+            .staticTexts.add({ staticLabel: "Please open an InDesign document before running this script." });
+        alertDialog.show();
+        alertDialog.destroy();
+        return;
+    }
+
+    const doc = app.activeDocument;
+    const context = detectTargetContext(doc);
+    const config = showConfigurationDialog(context);
+
+    if (!config || config.enabledRuleIds.size === 0) {
+        return;
+    }
+
+    let executionSummary = { ruleResults: [], totalFixes: 0 };
+
+    // Wrap all GREP replacements in a single undoable script transaction
+    app.doScript(
+        () => {
+            executionSummary = executeRules(config);
+        },
+        SCRIPT_LANG,
+        [],
+        UNDO_ENTIRE_SCRIPT,
+        "Devanagari Typography Cleanup"
+    );
+
+    showSummaryDialog(config.targetLabel, executionSummary);
+}
+
+try {
+    main();
+} catch (error) {
+    resetFindChangePreferences();
+    console.error("DevanagariBookTypesetter Error:", error);
+}
