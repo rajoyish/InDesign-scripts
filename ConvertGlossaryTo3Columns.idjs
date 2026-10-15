@@ -1,0 +1,1873 @@
+// ConvertGlossaryTo3Columns.idjs
+// Modern UXP JavaScript (.idjs) for Adobe InDesign v18.0+
+// Converts Generated Index Text (Word | Meaning #Pages) into a headless 3-Column Layout
+// Made with ❤️ by Rajesh Budhathoki
+
+const indesign = require("indesign");
+const {
+  app,
+  UndoModes,
+  ScriptLanguage,
+} = indesign;
+
+// Cross-version safe UXP Enum resolution
+const ENTIRE_SCRIPT =
+  UndoModes && (UndoModes.ENTIRE_SCRIPT ?? UndoModes.entireScript);
+const UXPSCRIPT_LANG =
+  ScriptLanguage &&
+  (ScriptLanguage.UXPSCRIPT ??
+    ScriptLanguage.JAVASCRIPT ??
+    ScriptLanguage.javascript);
+
+// Default sample data from InDesign's "Generate Index" output
+const DEFAULT_SAMPLE_DATA = [
+  "अक्षय | कहिल्यै क्षय नहुने वा नसकिने #40, 191",
+  "अज्ञान | अज्ञानता । सामान्यतया आफ्नो वास्तविक स्वरूपबारे अनभिज्ञ रहनु । #68",
+  "अधर्म | अधर्म वा अन्याय । धर्मको विपरीत भाव वा आचरण । #81, 90, 95",
+  "अनुग्रह | कृपा वा अनुकम्पा #146, 147, 148, 150",
+].join("\n");
+
+// ============================================================================
+// LIGHT MODE THEME PALETTE & SVG / ICON HELPERS
+// ============================================================================
+
+const THEME = {
+  appBg: "#F8FAFC",
+  cardBg: "#FFFFFF",
+  subtleBg: "#F1F5F9",
+  border: "#E2E8F0",
+  borderStrong: "#CBD5E1",
+  textMain: "#0F172A",
+  textSecondary: "#475569",
+  textMuted: "#64748B",
+  primary: "#2563EB",
+  primarySoft: "#EFF6FF",
+  primaryBorder: "#BFDBFE",
+  successBg: "#DCFCE7",
+  successText: "#15803D",
+  successBorder: "#86EFAC",
+  infoBg: "#DBEAFE",
+  infoText: "#1D4ED8",
+  infoBorder: "#93C5FD",
+  warnBg: "#FEF3C7",
+  warnText: "#B45309",
+  warnBorder: "#FDE68A",
+  dangerBg: "#FEE2E2",
+  dangerText: "#B91C1C",
+  dangerBorder: "#FCA5A5",
+  purpleBg: "#F3E8FF",
+  purpleText: "#6D28D9",
+  purpleBorder: "#DDD6FE",
+};
+
+function createIconBadge(emojiChar, bgColor, textColor, sizePx = 28) {
+  const badge = document.createElement("div");
+  badge.style.display = "flex";
+  badge.style.alignItems = "center";
+  badge.style.justifyContent = "center";
+  badge.style.width = `${sizePx}px`;
+  badge.style.height = `${sizePx}px`;
+  badge.style.borderRadius = "6px";
+  badge.style.backgroundColor = bgColor;
+  badge.style.color = textColor;
+  badge.style.fontSize = `${Math.round(sizePx * 0.56)}px`;
+  badge.style.flexShrink = "0";
+  badge.textContent = emojiChar;
+  return badge;
+}
+
+function createSvgIcon(pathData, color = "#2563EB", size = 15) {
+  try {
+    const ns = "http://www.w3.org/2000/svg";
+    const svg = document.createElementNS(ns, "svg");
+    svg.setAttribute("width", String(size));
+    svg.setAttribute("height", String(size));
+    svg.setAttribute("viewBox", "0 0 24 24");
+    svg.setAttribute("fill", "none");
+    svg.style.flexShrink = "0";
+
+    const path = document.createElementNS(ns, "path");
+    path.setAttribute("d", pathData);
+    path.setAttribute("stroke", color);
+    path.setAttribute("stroke-width", "2");
+    path.setAttribute("stroke-linecap", "round");
+    path.setAttribute("stroke-linejoin", "round");
+
+    svg.appendChild(path);
+    return svg;
+  } catch (e) {
+    const fallback = document.createElement("div");
+    fallback.textContent = "•";
+    fallback.style.color = color;
+    return fallback;
+  }
+}
+
+const SVG_PATHS = {
+  columns: "M12 3v18M3 3h18v18H3V3z",
+  settings: "M4 21v-7M4 10V3M12 21v-9M12 8V3M20 21v-5M20 12V3M1 14h6M9 8h6M17 16h6",
+  list: "M8 6h13M8 12h13M8 18h13M3 6h.01M3 12h.01M3 18h.01",
+  chart: "M18 20V10M12 20V4M6 20v-6",
+};
+
+// ============================================================================
+// 1. UXP DOM, SELECTION & UNDO HELPERS
+// ============================================================================
+
+function getItem(collectionOrArray, index) {
+  if (!collectionOrArray) return null;
+  try {
+    if (Array.isArray(collectionOrArray)) {
+      return collectionOrArray[index] ?? null;
+    }
+    if (typeof collectionOrArray.item === "function") {
+      const el = collectionOrArray.item(index);
+      return el && el.isValid !== false ? el : null;
+    }
+    return collectionOrArray[index] ?? null;
+  } catch (e) {
+    return null;
+  }
+}
+
+function getClassName(obj) {
+  if (!obj) return "";
+  try {
+    if (typeof obj.constructorName === "string" && obj.constructorName) {
+      return obj.constructorName;
+    }
+    if (obj.constructor && typeof obj.constructor.name === "string") {
+      return obj.constructor.name;
+    }
+  } catch (e) {}
+  return "";
+}
+
+function runWithUndo(fn, undoLabel) {
+  try {
+    if (typeof app.doScript === "function" && UXPSCRIPT_LANG && ENTIRE_SCRIPT) {
+      app.doScript(fn, UXPSCRIPT_LANG, [], ENTIRE_SCRIPT, undoLabel);
+      return;
+    }
+  } catch (e) {}
+  fn();
+}
+
+/**
+ * Resolves the user's active selection in InDesign into a targetable Text/TextFrame object.
+ * Supports: selected Text range, Paragraph, TextColumn, Story, or selected TextFrame.
+ */
+function resolveSelectedTextTarget(doc) {
+  if (!doc) return { target: null, text: "", typeLabel: "None" };
+
+  try {
+    const sel = doc.selection || app.selection;
+    if (!sel || sel.length === 0) {
+      return { target: null, text: "", typeLabel: "No Selection" };
+    }
+
+    const firstSel = getItem(sel, 0);
+    if (!firstSel) {
+      return { target: null, text: "", typeLabel: "No Selection" };
+    }
+
+    const cName = getClassName(firstSel);
+
+    // Case 1: User selected a TextFrame directly with the Selection Tool (V)
+    if (cName === "TextFrame") {
+      const tfText =
+        firstSel.texts && firstSel.texts.length > 0
+          ? getItem(firstSel.texts, 0)
+          : firstSel.parentStory;
+      const raw = String(firstSel.contents || "");
+      return {
+        target: tfText || firstSel,
+        textFrame: firstSel,
+        text: raw,
+        typeLabel: "Selected Text Frame",
+      };
+    }
+
+    // Case 2: User highlighted a text range (Text, Paragraph, TextStyleRange, TextColumn, Story)
+    if (
+      "contents" in firstSel &&
+      typeof firstSel.contents === "string" &&
+      firstSel.contents.trim().length > 0
+    ) {
+      return {
+        target: firstSel,
+        textFrame: null,
+        text: String(firstSel.contents),
+        typeLabel: `Selected ${cName || "Text"}`,
+      };
+    }
+
+    // Case 3: Cursor is blinking inside a Story / TextFrame (InsertionPoint) -> offer parent Story
+    if (cName === "InsertionPoint" && firstSel.parentStory) {
+      const story = firstSel.parentStory;
+      const storyText =
+        story.texts && story.texts.length > 0 ? getItem(story.texts, 0) : story;
+      const raw = String(story.contents || "");
+      if (raw.trim().length > 0) {
+        return {
+          target: storyText,
+          textFrame: null,
+          text: raw,
+          typeLabel: "Active Story (Cursor Inside)",
+        };
+      }
+    }
+  } catch (e) {}
+
+  return { target: null, text: "", typeLabel: "No Valid Text Selected" };
+}
+
+// ============================================================================
+// 2. UXP SAFE OVERLAY ALERT DIALOG
+// ============================================================================
+
+async function showAlertDialog(title, message, parentOverlayHost = null) {
+  return new Promise((resolve) => {
+    let settled = false;
+
+    if (parentOverlayHost) {
+      const backdrop = document.createElement("div");
+      backdrop.style.position = "fixed";
+      backdrop.style.top = "0";
+      backdrop.style.left = "0";
+      backdrop.style.right = "0";
+      backdrop.style.bottom = "0";
+      backdrop.style.backgroundColor = "rgba(15, 23, 42, 0.45)";
+      backdrop.style.display = "flex";
+      backdrop.style.alignItems = "center";
+      backdrop.style.justifyContent = "center";
+      backdrop.style.zIndex = "9999";
+      backdrop.style.padding = "20px";
+
+      const card = document.createElement("div");
+      card.style.display = "flex";
+      card.style.flexDirection = "column";
+      card.style.backgroundColor = THEME.cardBg;
+      card.style.color = THEME.textMain;
+      card.style.border = `1px solid ${THEME.borderStrong}`;
+      card.style.borderRadius = "10px";
+      card.style.padding = "20px 22px";
+      card.style.minWidth = "380px";
+      card.style.maxWidth = "520px";
+      card.style.boxShadow = "0 10px 25px rgba(0,0,0,0.15)";
+
+      const headRow = document.createElement("div");
+      headRow.style.display = "flex";
+      headRow.style.alignItems = "center";
+      headRow.style.gap = "10px";
+      headRow.style.marginBottom = "12px";
+
+      headRow.appendChild(createIconBadge("ℹ️", THEME.infoBg, THEME.infoText, 28));
+
+      const heading = document.createElement("div");
+      heading.textContent = title || "Notice";
+      heading.style.fontSize = "15px";
+      heading.style.fontWeight = "700";
+      heading.style.color = THEME.textMain;
+      headRow.appendChild(heading);
+      card.appendChild(headRow);
+
+      const body = document.createElement("div");
+      body.textContent = message || "";
+      body.style.fontSize = "12.5px";
+      body.style.lineHeight = "1.55";
+      body.style.whiteSpace = "pre-wrap";
+      body.style.maxHeight = "300px";
+      body.style.overflowY = "auto";
+      body.style.marginBottom = "18px";
+      body.style.padding = "10px 12px";
+      body.style.backgroundColor = THEME.appBg;
+      body.style.border = `1px solid ${THEME.border}`;
+      body.style.borderRadius = "6px";
+      body.style.color = THEME.textSecondary;
+      card.appendChild(body);
+
+      const btnRow = document.createElement("div");
+      btnRow.style.display = "flex";
+      btnRow.style.justifyContent = "flex-end";
+
+      const okBtn = document.createElement("button");
+      okBtn.textContent = "✓ OK";
+      okBtn.style.padding = "7px 22px";
+      okBtn.style.borderRadius = "6px";
+      okBtn.style.border = "none";
+      okBtn.style.backgroundColor = THEME.primary;
+      okBtn.style.color = "#FFFFFF";
+      okBtn.style.fontWeight = "600";
+      okBtn.style.fontSize = "12.5px";
+      okBtn.style.cursor = "pointer";
+
+      const closeOverlay = () => {
+        if (settled) return;
+        settled = true;
+        try {
+          backdrop.remove();
+        } catch (e) {}
+        resolve();
+      };
+
+      okBtn.addEventListener("click", closeOverlay);
+      btnRow.appendChild(okBtn);
+      card.appendChild(btnRow);
+      backdrop.appendChild(card);
+      parentOverlayHost.appendChild(backdrop);
+      return;
+    }
+
+    const dlg = document.createElement("dialog");
+    dlg.style.padding = "0";
+    dlg.style.border = `1px solid ${THEME.borderStrong}`;
+    dlg.style.borderRadius = "10px";
+    dlg.style.backgroundColor = THEME.cardBg;
+    dlg.style.color = THEME.textMain;
+    dlg.style.minWidth = "380px";
+    dlg.style.maxWidth = "520px";
+    dlg.style.fontFamily = "system-ui, -apple-system, sans-serif";
+
+    const wrapper = document.createElement("div");
+    wrapper.style.display = "flex";
+    wrapper.style.flexDirection = "column";
+    wrapper.style.padding = "22px";
+
+    const heading = document.createElement("div");
+    heading.textContent = title || "Notice";
+    heading.style.fontSize = "15px";
+    heading.style.fontWeight = "700";
+    heading.style.marginBottom = "10px";
+    wrapper.appendChild(heading);
+
+    const body = document.createElement("div");
+    body.textContent = message || "";
+    body.style.fontSize = "12.5px";
+    body.style.lineHeight = "1.55";
+    body.style.whiteSpace = "pre-wrap";
+    body.style.marginBottom = "18px";
+    body.style.color = THEME.textSecondary;
+    wrapper.appendChild(body);
+
+    const btnRow = document.createElement("div");
+    btnRow.style.display = "flex";
+    btnRow.style.justifyContent = "flex-end";
+
+    const okBtn = document.createElement("button");
+    okBtn.textContent = "✓ OK";
+    okBtn.style.padding = "7px 22px";
+    okBtn.style.borderRadius = "6px";
+    okBtn.style.border = "none";
+    okBtn.style.backgroundColor = THEME.primary;
+    okBtn.style.color = "#FFFFFF";
+    okBtn.style.fontWeight = "600";
+    okBtn.style.cursor = "pointer";
+
+    const closeDialog = () => {
+      if (settled) return;
+      settled = true;
+      try {
+        dlg.close();
+      } catch (e) {}
+      try {
+        dlg.remove();
+      } catch (e) {}
+      resolve();
+    };
+
+    okBtn.addEventListener("click", closeDialog);
+    dlg.addEventListener("cancel", closeDialog);
+
+    btnRow.appendChild(okBtn);
+    wrapper.appendChild(btnRow);
+    dlg.appendChild(wrapper);
+    document.body.appendChild(dlg);
+    dlg.showModal();
+  });
+}
+
+// ============================================================================
+// 3. HIGH-SPEED 3-COLUMN PARSER & NUMERAL CONVERTER
+// ============================================================================
+
+const EN_TO_NE_DIGITS = {
+  "0": "०",
+  "1": "१",
+  "2": "२",
+  "3": "३",
+  "4": "४",
+  "5": "५",
+  "6": "६",
+  "7": "७",
+  "8": "८",
+  "9": "९",
+};
+
+const NE_TO_EN_DIGITS = {
+  "०": "0",
+  "१": "1",
+  "२": "2",
+  "३": "3",
+  "४": "4",
+  "५": "5",
+  "६": "6",
+  "७": "7",
+  "८": "8",
+  "९": "9",
+};
+
+function toDevanagariDigits(str) {
+  return String(str).replace(/[0-9]/g, (d) => EN_TO_NE_DIGITS[d] || d);
+}
+
+function toEnglishDigits(str) {
+  return String(str).replace(/[०-९]/g, (d) => NE_TO_EN_DIGITS[d] || d);
+}
+
+function cleanInvisibleChars(str) {
+  if (!str) return "";
+  let cleaned = String(str)
+    .replace(/[\uFEFF\u200B\u0008]/g, "")
+    .replace(/~I/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (typeof cleaned.normalize === "function") {
+    cleaned = cleaned.normalize("NFC");
+  }
+  return cleaned;
+}
+
+/**
+ * Formats, deduplicates, and optionally converts numerals for the Page Numbers column
+ */
+function formatPageNumbers(rawPagesStr, numeralMode = "KEEP", sortAndDedup = true) {
+  if (!rawPagesStr) return { formatted: "", count: 0 };
+
+  const tokens = String(rawPagesStr)
+    .split(",")
+    .map((t) => t.trim())
+    .filter(Boolean);
+
+  if (tokens.length === 0) return { formatted: "", count: 0 };
+
+  let processed = tokens;
+
+  if (sortAndDedup) {
+    const seen = new Set();
+    const unique = [];
+    for (let i = 0; i < processed.length; i++) {
+      const normalizedEn = toEnglishDigits(processed[i]);
+      if (!seen.has(normalizedEn)) {
+        seen.add(normalizedEn);
+        unique.push({ raw: processed[i], num: parseInt(normalizedEn, 10) });
+      }
+    }
+    unique.sort((a, b) => {
+      if (!isNaN(a.num) && !isNaN(b.num)) return a.num - b.num;
+      return 0;
+    });
+    processed = unique.map((u) => u.raw);
+  }
+
+  let joined = processed.join(", ");
+  if (numeralMode === "DEVANAGARI") {
+    joined = toDevanagariDigits(joined);
+  } else if (numeralMode === "ENGLISH") {
+    joined = toEnglishDigits(joined);
+  }
+
+  return {
+    formatted: joined,
+    count: processed.length,
+  };
+}
+
+/**
+ * Parses lines like:
+ *   "अक्षय | कहिल्यै क्षय नहुने वा नसकिने #40, 191"
+ * into 3 headless columns:
+ *   Column 1 (शब्द): अक्षय
+ *   Column 2 (अर्थ): कहिल्यै क्षय नहुने वा नसकिने
+ *   Column 3 (पेज नं.): 40, 191
+ */
+function parseIndexLinesTo3Columns(
+  rawText,
+  wordDelimiter = "|",
+  pageDelimiter = "#",
+  numeralMode = "KEEP",
+  sortPages = true
+) {
+  const rawLines = String(rawText || "").split(/\r\n|\r|\n/);
+  const rows = [];
+  const skippedDetails = [];
+
+  let totalNonEmptyLines = 0;
+  let totalPageRefsCount = 0;
+  let multiPageRowsCount = 0;
+  let singlePageRowsCount = 0;
+
+  const wDelim = wordDelimiter || "|";
+  const pDelim = pageDelimiter || "#";
+
+  for (let i = 0; i < rawLines.length; i++) {
+    const line = cleanInvisibleChars(rawLines[i]);
+    if (!line) continue;
+    totalNonEmptyLines++;
+
+    // Skip accidental header lines if present in selection
+    if (
+      line.includes("शब्द") &&
+      line.includes("अर्थ") &&
+      (line.includes("पेज") || line.includes("पृष्ठ"))
+    ) {
+      skippedDetails.push({
+        lineNumber: i + 1,
+        text: line,
+        reason: "Header Row Ignored (Headless 3-Col Mode)",
+      });
+      continue;
+    }
+
+    const wIdx = line.indexOf(wDelim);
+    if (wIdx === -1) {
+      skippedDetails.push({
+        lineNumber: i + 1,
+        text: line,
+        reason:
+          line.length <= 4
+            ? "Index Alphabet Section Heading"
+            : `Missing '${wDelim}' separator`,
+      });
+      continue;
+    }
+
+    const wordPart = cleanInvisibleChars(line.slice(0, wIdx));
+    const restPart = line.slice(wIdx + wDelim.length);
+
+    let meaningPart = "";
+    let rawPagesPart = "";
+
+    const pIdx = restPart.lastIndexOf(pDelim);
+    if (pIdx !== -1) {
+      meaningPart = cleanInvisibleChars(restPart.slice(0, pIdx));
+      rawPagesPart = cleanInvisibleChars(restPart.slice(pIdx + pDelim.length));
+    } else {
+      // Fallback if '#' was omitted and page numbers trail at the end
+      const trailingPagesMatch = restPart.match(
+        /^(.*?)[\s\t]+([0-9०-९]+(?:\s*,\s*[0-9०-९]+)*)$/
+      );
+      if (trailingPagesMatch) {
+        meaningPart = cleanInvisibleChars(trailingPagesMatch[1]);
+        rawPagesPart = cleanInvisibleChars(trailingPagesMatch[2]);
+      } else {
+        meaningPart = cleanInvisibleChars(restPart);
+        rawPagesPart = "";
+      }
+    }
+
+    if (!wordPart && !meaningPart) {
+      skippedDetails.push({
+        lineNumber: i + 1,
+        text: line,
+        reason: "Empty Word & Meaning",
+      });
+      continue;
+    }
+
+    const pageInfo = formatPageNumbers(rawPagesPart, numeralMode, sortPages);
+    totalPageRefsCount += pageInfo.count;
+    if (pageInfo.count > 1) {
+      multiPageRowsCount++;
+    } else if (pageInfo.count === 1) {
+      singlePageRowsCount++;
+    }
+
+    rows.push({
+      rowNumber: rows.length + 1,
+      word: wordPart,
+      meaning: meaningPart,
+      pages: pageInfo.formatted,
+      pageCount: pageInfo.count,
+    });
+  }
+
+  // Build Tab-Separated 3-Column String (NO HEADER ROW)
+  // Using \r for InDesign DOM compatibility and \n for system clipboard compatibility
+  const indesignTabString = rows
+    .map((r) => `${r.word}\t${r.meaning}\t${r.pages}`)
+    .join("\r");
+
+  const clipboardTabString = rows
+    .map((r) => `${r.word}\t${r.meaning}\t${r.pages}`)
+    .join("\n");
+
+  return {
+    rows,
+    skippedDetails,
+    totalNonEmptyLines,
+    validRowCount: rows.length,
+    totalCellsCount: rows.length * 3,
+    totalPageRefsCount,
+    multiPageRowsCount,
+    singlePageRowsCount,
+    indesignTabString,
+    clipboardTabString,
+  };
+}
+
+// ============================================================================
+// 4. HIGH-PERFORMANCE INDESIGN 3-COLUMN CONVERSION ENGINE
+// ============================================================================
+
+/**
+ * Converts the selected InDesign text into a headless 3-Column layout
+ * (either a 3-Column InDesign Table with 0 header rows, or 3-Column Tab-Delimited Text).
+ * Uses single-batch DOM operations inside one Undo step for maximum speed.
+ */
+function executeInDesignConversion(doc, selectionInfo, parsedData, outputMode) {
+  const startTime = Date.now();
+  let createdTable = null;
+  let conversionMethod = "";
+
+  let oldRedraw = true;
+  try {
+    oldRedraw = app.scriptPreferences.enableRedraw;
+    app.scriptPreferences.enableRedraw = false;
+  } catch (e) {}
+
+  try {
+    runWithUndo(() => {
+      let target = selectionInfo ? selectionInfo.target : null;
+
+      // Re-resolve live selection in case user changed selection
+      if (!target || target.isValid === false) {
+        const fresh = resolveSelectedTextTarget(doc);
+        target = fresh.target;
+      }
+
+      if (!target) {
+        throw new Error(
+          "No active text selection found in the document. Use 'Copy 3-Column Data' or select the text in InDesign first."
+        );
+      }
+
+      if (outputMode === "TAB_TEXT") {
+        // Fast single-operation replacement with 3-column tab-separated rows (No Header)
+        target.contents = parsedData.indesignTabString;
+        conversionMethod = "3-Column Tab-Delimited Text (In-Place)";
+        return;
+      }
+
+      // Default Mode: Convert to 3-Column InDesign Table (0 Header Rows)
+      // Step 1: Track Story & start offset before replacing contents
+      const parentStory = target.parentStory || null;
+      const startIndex =
+        typeof target.index === "number" ? target.index : 0;
+
+      // Step 2: Single DOM write of tab-separated rows
+      target.contents = parsedData.indesignTabString;
+
+      // Step 3: Resolve the updated text range and invoke native C++ convertToTable("\t", "\r")
+      let rangeToConvert = target;
+      if (parentStory && parentStory.characters) {
+        const endIndex =
+          startIndex + parsedData.indesignTabString.length - 1;
+        if (endIndex >= startIndex) {
+          try {
+            rangeToConvert = parentStory.characters.itemByRange(
+              startIndex,
+              endIndex
+            );
+          } catch (eRange) {}
+        }
+      }
+
+      if (rangeToConvert && typeof rangeToConvert.convertToTable === "function") {
+        createdTable = rangeToConvert.convertToTable("\t", "\r");
+        conversionMethod = "3-Column Headless Table (Native convertToTable)";
+      } else if (
+        selectionInfo &&
+        selectionInfo.textFrame &&
+        selectionInfo.textFrame.texts &&
+        selectionInfo.textFrame.texts.length > 0
+      ) {
+        const tfText = getItem(selectionInfo.textFrame.texts, 0);
+        createdTable = tfText.convertToTable("\t", "\r");
+        conversionMethod = "3-Column Headless Table (TextFrame)";
+      }
+
+      // Ensure 0 header rows so all rows are pure body rows ready to copy/paste into existing table
+      if (createdTable && createdTable.isValid !== false) {
+        try {
+          if (createdTable.headerRowCount > 0) {
+            createdTable.headerRowCount = 0;
+          }
+        } catch (eHdr) {}
+
+        // Select all cells of the newly created 3-column table so Cmd/Ctrl+C copies cells directly!
+        try {
+          if (createdTable.cells && createdTable.cells.length > 0) {
+            app.select(createdTable.cells.everyItem());
+          }
+        } catch (eSel) {}
+      }
+    }, "Convert Index Text to 3-Column Layout");
+  } finally {
+    try {
+      app.scriptPreferences.enableRedraw = oldRedraw;
+    } catch (e) {}
+  }
+
+  return {
+    durationMs: Date.now() - startTime,
+    createdTable,
+    conversionMethod,
+  };
+}
+
+// ============================================================================
+// 5. MAIN MODERN LIGHT-MODE UI WITH STATS & EXPANDABLE PREVIEW
+// ============================================================================
+
+function createStatPill(iconEmoji, label, initialValue, accentColor, softBg) {
+  const pill = document.createElement("div");
+  pill.style.display = "flex";
+  pill.style.flexDirection = "row";
+  pill.style.alignItems = "center";
+  pill.style.gap = "10px";
+  pill.style.flex = "1";
+  pill.style.minWidth = "140px";
+  pill.style.padding = "10px 12px";
+  pill.style.backgroundColor = THEME.cardBg;
+  pill.style.border = `1px solid ${THEME.border}`;
+  pill.style.borderRadius = "8px";
+  pill.style.flexShrink = "0";
+
+  const iconEl = createIconBadge(iconEmoji, softBg, accentColor, 32);
+
+  const textCol = document.createElement("div");
+  textCol.style.display = "flex";
+  textCol.style.flexDirection = "column";
+
+  const valEl = document.createElement("div");
+  valEl.textContent = String(initialValue);
+  valEl.style.fontSize = "16px";
+  valEl.style.fontWeight = "700";
+  valEl.style.color = accentColor || THEME.textMain;
+  valEl.style.lineHeight = "1.2";
+
+  const lblEl = document.createElement("div");
+  lblEl.textContent = label;
+  lblEl.style.fontSize = "11px";
+  lblEl.style.fontWeight = "500";
+  lblEl.style.color = THEME.textMuted;
+  lblEl.style.marginTop = "2px";
+
+  textCol.appendChild(valEl);
+  textCol.appendChild(lblEl);
+
+  pill.appendChild(iconEl);
+  pill.appendChild(textCol);
+
+  return { pill, valEl, lblEl };
+}
+
+async function main() {
+  if (app.documents.length === 0) {
+    await showAlertDialog(
+      "No Document Open",
+      "Please open an InDesign document and select the generated index text first."
+    );
+    return;
+  }
+
+  const doc = app.activeDocument;
+  let selectionInfo = resolveSelectedTextTarget(doc);
+  const hasInitialSelection =
+    selectionInfo.target !== null && selectionInfo.text.trim().length > 0;
+
+  // Build Modern Light-Mode UXP Modal Dialog
+  const dialog = document.createElement("dialog");
+  dialog.style.padding = "0";
+  dialog.style.border = `1px solid ${THEME.borderStrong}`;
+  dialog.style.borderRadius = "12px";
+  dialog.style.backgroundColor = THEME.appBg;
+  dialog.style.color = THEME.textMain;
+  dialog.style.width = "720px";
+  dialog.style.maxHeight = "92vh";
+  dialog.style.fontFamily = "system-ui, -apple-system, sans-serif";
+  dialog.style.position = "relative";
+
+  const container = document.createElement("div");
+  container.style.display = "flex";
+  container.style.flexDirection = "column";
+  container.style.padding = "20px 22px";
+  container.style.gap = "14px";
+  container.style.maxHeight = "88vh";
+  container.style.overflowY = "auto";
+
+  // --- 1. Header Row ---
+  const headerRow = document.createElement("div");
+  headerRow.style.display = "flex";
+  headerRow.style.justifyContent = "space-between";
+  headerRow.style.alignItems = "center";
+  headerRow.style.paddingBottom = "10px";
+  headerRow.style.borderBottom = `1px solid ${THEME.border}`;
+  headerRow.style.flexShrink = "0";
+
+  const titleLeft = document.createElement("div");
+  titleLeft.style.display = "flex";
+  titleLeft.style.alignItems = "center";
+  titleLeft.style.gap = "10px";
+
+  const appIcon = createIconBadge("📐", THEME.primarySoft, THEME.primary, 36);
+
+  const titleTextWrap = document.createElement("div");
+  titleTextWrap.style.display = "flex";
+  titleTextWrap.style.flexDirection = "column";
+
+  const titleEl = document.createElement("div");
+  titleEl.textContent = "Convert Index Text to 3-Column Layout";
+  titleEl.style.fontSize = "16px";
+  titleEl.style.fontWeight = "700";
+  titleEl.style.color = THEME.textMain;
+
+  const subtitleEl = document.createElement("div");
+  subtitleEl.textContent =
+    "Formats [शब्द | अर्थ #पेज नं.] into 3 headless columns ready for existing tables";
+  subtitleEl.style.fontSize = "11.5px";
+  subtitleEl.style.color = THEME.textMuted;
+  subtitleEl.style.marginTop = "2px";
+
+  titleTextWrap.appendChild(titleEl);
+  titleTextWrap.appendChild(subtitleEl);
+  titleLeft.appendChild(appIcon);
+  titleLeft.appendChild(titleTextWrap);
+
+  const selBadge = document.createElement("div");
+  selBadge.textContent = hasInitialSelection
+    ? `🎯 ${selectionInfo.typeLabel}`
+    : "📋 Using Editor Text";
+  selBadge.style.fontSize = "11.5px";
+  selBadge.style.fontWeight = "600";
+  selBadge.style.padding = "5px 10px";
+  selBadge.style.borderRadius = "6px";
+  selBadge.style.backgroundColor = hasInitialSelection
+    ? THEME.successBg
+    : THEME.warnBg;
+  selBadge.style.border = `1px solid ${
+    hasInitialSelection ? THEME.successBorder : THEME.warnBorder
+  }`;
+  selBadge.style.color = hasInitialSelection
+    ? THEME.successText
+    : THEME.warnText;
+  selBadge.style.flexShrink = "0";
+
+  headerRow.appendChild(titleLeft);
+  headerRow.appendChild(selBadge);
+  container.appendChild(headerRow);
+
+  // --- 2. Live Top KPI Bar ---
+  const liveStatsBar = document.createElement("div");
+  liveStatsBar.style.display = "flex";
+  liveStatsBar.style.flexWrap = "wrap";
+  liveStatsBar.style.gap = "10px";
+  liveStatsBar.style.flexShrink = "0";
+
+  const statValidRows = createStatPill(
+    "📑",
+    "3-Col Rows Ready",
+    0,
+    "#2563EB",
+    "#EFF6FF"
+  );
+  const statTotalCells = createStatPill(
+    "🧱",
+    "Total Table Cells (×3)",
+    0,
+    "#15803D",
+    "#DCFCE7"
+  );
+  const statPageRefs = createStatPill(
+    "🔖",
+    "Total Page Numbers",
+    0,
+    "#B45309",
+    "#FEF3C7"
+  );
+  const statSkippedLines = createStatPill(
+    "🧹",
+    "Skipped / Section Lines",
+    0,
+    "#6D28D9",
+    "#F3E8FF"
+  );
+
+  liveStatsBar.appendChild(statValidRows.pill);
+  liveStatsBar.appendChild(statTotalCells.pill);
+  liveStatsBar.appendChild(statPageRefs.pill);
+  liveStatsBar.appendChild(statSkippedLines.pill);
+  container.appendChild(liveStatsBar);
+
+  // --- 3. Conversion Settings Panel ---
+  const optionsPanel = document.createElement("div");
+  optionsPanel.style.display = "flex";
+  optionsPanel.style.flexDirection = "column";
+  optionsPanel.style.gap = "12px";
+  optionsPanel.style.padding = "14px 16px";
+  optionsPanel.style.backgroundColor = THEME.cardBg;
+  optionsPanel.style.border = `1px solid ${THEME.border}`;
+  optionsPanel.style.borderRadius = "8px";
+  optionsPanel.style.flexShrink = "0";
+
+  const optHeader = document.createElement("div");
+  optHeader.style.display = "flex";
+  optHeader.style.justifyContent = "space-between";
+  optHeader.style.alignItems = "center";
+
+  const optHeaderLeft = document.createElement("div");
+  optHeaderLeft.style.display = "flex";
+  optHeaderLeft.style.alignItems = "center";
+  optHeaderLeft.style.gap = "8px";
+  optHeaderLeft.appendChild(
+    createSvgIcon(SVG_PATHS.settings, THEME.primary, 15)
+  );
+
+  const optTitle = document.createElement("div");
+  optTitle.textContent = "⚙️ 3-Column Formatting Options (Header Row Omitted)";
+  optTitle.style.fontSize = "12.5px";
+  optTitle.style.fontWeight = "700";
+  optTitle.style.color = THEME.textMain;
+  optHeaderLeft.appendChild(optTitle);
+
+  const schemaChip = document.createElement("div");
+  schemaChip.textContent = "Col 1: शब्द  │  Col 2: अर्थ  │  Col 3: पेज नं.";
+  schemaChip.style.fontSize = "11px";
+  schemaChip.style.fontWeight = "600";
+  schemaChip.style.padding = "3px 9px";
+  schemaChip.style.borderRadius = "6px";
+  schemaChip.style.backgroundColor = THEME.subtleBg;
+  schemaChip.style.border = `1px solid ${THEME.borderStrong}`;
+  schemaChip.style.color = THEME.textSecondary;
+
+  optHeader.appendChild(optHeaderLeft);
+  optHeader.appendChild(schemaChip);
+  optionsPanel.appendChild(optHeader);
+
+  // Row 1: Output Mode + Page Numeral Format
+  const modeAndNumRow = document.createElement("div");
+  modeAndNumRow.style.display = "flex";
+  modeAndNumRow.style.flexWrap = "wrap";
+  modeAndNumRow.style.alignItems = "center";
+  modeAndNumRow.style.justifyContent = "space-between";
+  modeAndNumRow.style.gap = "12px";
+
+  const modeGroup = document.createElement("div");
+  modeGroup.style.display = "flex";
+  modeGroup.style.alignItems = "center";
+  modeGroup.style.gap = "8px";
+  modeGroup.style.flex = "1";
+
+  const modeLabel = document.createElement("div");
+  modeLabel.textContent = "📐 Output Format:";
+  modeLabel.style.fontSize = "12.5px";
+  modeLabel.style.fontWeight = "600";
+  modeLabel.style.color = THEME.textSecondary;
+  modeLabel.style.flexShrink = "0";
+
+  const modeSelect = document.createElement("select");
+  modeSelect.style.flex = "1";
+  modeSelect.style.padding = "6px 10px";
+  modeSelect.style.borderRadius = "6px";
+  modeSelect.style.border = `1px solid ${THEME.borderStrong}`;
+  modeSelect.style.backgroundColor = THEME.cardBg;
+  modeSelect.style.color = THEME.textMain;
+  modeSelect.style.fontSize = "12px";
+
+  const optTable = document.createElement("option");
+  optTable.value = "TABLE_NO_HEADER";
+  optTable.textContent =
+    "3-Column InDesign Table (No Headers — Selects Cells to Copy/Paste)";
+  modeSelect.appendChild(optTable);
+
+  const optTab = document.createElement("option");
+  optTab.value = "TAB_TEXT";
+  optTab.textContent =
+    "3-Column Tab-Separated Text (शब्द \\t अर्थ \\t पेज नं.)";
+  modeSelect.appendChild(optTab);
+  modeSelect.selectedIndex = 0;
+
+  modeGroup.appendChild(modeLabel);
+  modeGroup.appendChild(modeSelect);
+
+  const numGroup = document.createElement("div");
+  numGroup.style.display = "flex";
+  numGroup.style.alignItems = "center";
+  numGroup.style.gap = "8px";
+
+  const numLabel = document.createElement("div");
+  numLabel.textContent = "🔢 Page Digits:";
+  numLabel.style.fontSize = "12.5px";
+  numLabel.style.fontWeight = "600";
+  numLabel.style.color = THEME.textSecondary;
+  numLabel.style.flexShrink = "0";
+
+  const numSelect = document.createElement("select");
+  numSelect.style.padding = "6px 10px";
+  numSelect.style.borderRadius = "6px";
+  numSelect.style.border = `1px solid ${THEME.borderStrong}`;
+  numSelect.style.backgroundColor = THEME.cardBg;
+  numSelect.style.color = THEME.textMain;
+  numSelect.style.fontSize = "12px";
+
+  const numKeep = document.createElement("option");
+  numKeep.value = "KEEP";
+  numKeep.textContent = "Keep Original (40, 191)";
+  numSelect.appendChild(numKeep);
+
+  const numNep = document.createElement("option");
+  numNep.value = "DEVANAGARI";
+  numNep.textContent = "Devanagari (४०, १९१)";
+  numSelect.appendChild(numNep);
+
+  const numEng = document.createElement("option");
+  numEng.value = "ENGLISH";
+  numEng.textContent = "English (40, 191)";
+  numSelect.appendChild(numEng);
+  numSelect.selectedIndex = 0;
+
+  numGroup.appendChild(numLabel);
+  numGroup.appendChild(numSelect);
+
+  modeAndNumRow.appendChild(modeGroup);
+  modeAndNumRow.appendChild(numGroup);
+  optionsPanel.appendChild(modeAndNumRow);
+
+  // Row 2: Separators & Checkboxes
+  const delimAndChkRow = document.createElement("div");
+  delimAndChkRow.style.display = "flex";
+  delimAndChkRow.style.flexWrap = "wrap";
+  delimAndChkRow.style.alignItems = "center";
+  delimAndChkRow.style.justifyContent = "space-between";
+  delimAndChkRow.style.gap = "12px";
+
+  const delimGroup = document.createElement("div");
+  delimGroup.style.display = "flex";
+  delimGroup.style.alignItems = "center";
+  delimGroup.style.gap = "8px";
+
+  const wordDelimLabel = document.createElement("div");
+  wordDelimLabel.textContent = "Meaning Split:";
+  wordDelimLabel.style.fontSize = "12px";
+  wordDelimLabel.style.fontWeight = "600";
+  wordDelimLabel.style.color = THEME.textSecondary;
+
+  const wordDelimInput = document.createElement("input");
+  wordDelimInput.type = "text";
+  wordDelimInput.value = "|";
+  wordDelimInput.style.width = "40px";
+  wordDelimInput.style.textAlign = "center";
+  wordDelimInput.style.padding = "4px 6px";
+  wordDelimInput.style.borderRadius = "6px";
+  wordDelimInput.style.border = `1px solid ${THEME.borderStrong}`;
+  wordDelimInput.style.backgroundColor = THEME.cardBg;
+  wordDelimInput.style.color = THEME.textMain;
+  wordDelimInput.style.fontWeight = "700";
+
+  const pageDelimLabel = document.createElement("div");
+  pageDelimLabel.textContent = "Page Split:";
+  pageDelimLabel.style.fontSize = "12px";
+  pageDelimLabel.style.fontWeight = "600";
+  pageDelimLabel.style.color = THEME.textSecondary;
+  pageDelimLabel.style.marginLeft = "6px";
+
+  const pageDelimInput = document.createElement("input");
+  pageDelimInput.type = "text";
+  pageDelimInput.value = "#";
+  pageDelimInput.style.width = "40px";
+  pageDelimInput.style.textAlign = "center";
+  pageDelimInput.style.padding = "4px 6px";
+  pageDelimInput.style.borderRadius = "6px";
+  pageDelimInput.style.border = `1px solid ${THEME.borderStrong}`;
+  pageDelimInput.style.backgroundColor = THEME.cardBg;
+  pageDelimInput.style.color = THEME.textMain;
+  pageDelimInput.style.fontWeight = "700";
+
+  delimGroup.appendChild(wordDelimLabel);
+  delimGroup.appendChild(wordDelimInput);
+  delimGroup.appendChild(pageDelimLabel);
+  delimGroup.appendChild(pageDelimInput);
+
+  const chkGroup = document.createElement("div");
+  chkGroup.style.display = "flex";
+  chkGroup.style.alignItems = "center";
+  chkGroup.style.gap = "10px";
+
+  const sortGroup = document.createElement("label");
+  sortGroup.style.display = "flex";
+  sortGroup.style.alignItems = "center";
+  sortGroup.style.gap = "6px";
+  sortGroup.style.padding = "5px 10px";
+  sortGroup.style.borderRadius = "6px";
+  sortGroup.style.backgroundColor = THEME.subtleBg;
+  sortGroup.style.border = `1px solid ${THEME.border}`;
+  sortGroup.style.fontSize = "12px";
+  sortGroup.style.fontWeight = "600";
+  sortGroup.style.color = THEME.textMain;
+  sortGroup.style.cursor = "pointer";
+
+  const chkSortPages = document.createElement("input");
+  chkSortPages.type = "checkbox";
+  chkSortPages.checked = true;
+  const sortText = document.createElement("div");
+  sortText.textContent = "🔢 Sort & Dedup Pages";
+  sortGroup.appendChild(chkSortPages);
+  sortGroup.appendChild(sortText);
+
+  const copyGroup = document.createElement("label");
+  copyGroup.style.display = "flex";
+  copyGroup.style.alignItems = "center";
+  copyGroup.style.gap = "6px";
+  copyGroup.style.padding = "5px 10px";
+  copyGroup.style.borderRadius = "6px";
+  copyGroup.style.backgroundColor = THEME.subtleBg;
+  copyGroup.style.border = `1px solid ${THEME.border}`;
+  copyGroup.style.fontSize = "12px";
+  copyGroup.style.fontWeight = "600";
+  copyGroup.style.color = THEME.textMain;
+  copyGroup.style.cursor = "pointer";
+
+  const chkAutoCopy = document.createElement("input");
+  chkAutoCopy.type = "checkbox";
+  chkAutoCopy.checked = true;
+  const copyText = document.createElement("div");
+  copyText.textContent = "📋 Auto-Copy 3 Columns";
+  copyGroup.appendChild(chkAutoCopy);
+  copyGroup.appendChild(copyText);
+
+  chkGroup.appendChild(sortGroup);
+  chkGroup.appendChild(copyGroup);
+
+  delimAndChkRow.appendChild(delimGroup);
+  delimAndChkRow.appendChild(chkGroup);
+  optionsPanel.appendChild(delimAndChkRow);
+
+  container.appendChild(optionsPanel);
+
+  // --- 4. Selected / Input Index Text Panel ---
+  const dataPanel = document.createElement("div");
+  dataPanel.style.display = "flex";
+  dataPanel.style.flexDirection = "column";
+  dataPanel.style.gap = "8px";
+  dataPanel.style.padding = "14px 16px";
+  dataPanel.style.backgroundColor = THEME.cardBg;
+  dataPanel.style.border = `1px solid ${THEME.border}`;
+  dataPanel.style.borderRadius = "8px";
+  dataPanel.style.flexShrink = "0";
+
+  const dataHeaderRow = document.createElement("div");
+  dataHeaderRow.style.display = "flex";
+  dataHeaderRow.style.justifyContent = "space-between";
+  dataHeaderRow.style.alignItems = "center";
+
+  const dataTitleLeft = document.createElement("div");
+  dataTitleLeft.style.display = "flex";
+  dataTitleLeft.style.alignItems = "center";
+  dataTitleLeft.style.gap = "8px";
+  dataTitleLeft.appendChild(createSvgIcon(SVG_PATHS.list, THEME.primary, 15));
+
+  const dataLabel = document.createElement("div");
+  dataLabel.textContent =
+    "📝 Source Index Text (Auto-loaded from InDesign Selection or Paste Below)";
+  dataLabel.style.fontSize = "12.5px";
+  dataLabel.style.fontWeight = "700";
+  dataLabel.style.color = THEME.textMain;
+  dataTitleLeft.appendChild(dataLabel);
+
+  const btnReloadSelection = document.createElement("button");
+  btnReloadSelection.textContent = "🔄 Reload From Selection";
+  btnReloadSelection.style.padding = "4px 10px";
+  btnReloadSelection.style.fontSize = "11.5px";
+  btnReloadSelection.style.fontWeight = "600";
+  btnReloadSelection.style.borderRadius = "6px";
+  btnReloadSelection.style.border = `1px solid ${THEME.borderStrong}`;
+  btnReloadSelection.style.backgroundColor = THEME.subtleBg;
+  btnReloadSelection.style.color = THEME.textMain;
+  btnReloadSelection.style.cursor = "pointer";
+
+  dataHeaderRow.appendChild(dataTitleLeft);
+  dataHeaderRow.appendChild(btnReloadSelection);
+  dataPanel.appendChild(dataHeaderRow);
+
+  const dataInput = document.createElement("textarea");
+  dataInput.value = hasInitialSelection
+    ? selectionInfo.text
+    : DEFAULT_SAMPLE_DATA;
+  dataInput.style.width = "100%";
+  dataInput.style.height = "120px";
+  dataInput.style.padding = "10px 12px";
+  dataInput.style.borderRadius = "6px";
+  dataInput.style.border = `1px solid ${THEME.borderStrong}`;
+  dataInput.style.backgroundColor = THEME.appBg;
+  dataInput.style.color = THEME.textMain;
+  dataInput.style.fontSize = "13px";
+  dataInput.style.lineHeight = "1.55";
+  dataInput.style.boxSizing = "border-box";
+  dataPanel.appendChild(dataInput);
+
+  container.appendChild(dataPanel);
+
+  // --- 5. Post-Task Execution Stats & Expandable 3-Column Preview Dashboard ---
+  const statsDashboard = document.createElement("div");
+  statsDashboard.style.display = "none";
+  statsDashboard.style.flexDirection = "column";
+  statsDashboard.style.gap = "12px";
+  statsDashboard.style.padding = "14px 16px";
+  statsDashboard.style.backgroundColor = THEME.cardBg;
+  statsDashboard.style.border = `1px solid ${THEME.primaryBorder}`;
+  statsDashboard.style.borderRadius = "8px";
+  statsDashboard.style.flexShrink = "0";
+
+  const statsHeaderRow = document.createElement("div");
+  statsHeaderRow.style.display = "flex";
+  statsHeaderRow.style.justifyContent = "space-between";
+  statsHeaderRow.style.alignItems = "center";
+  statsHeaderRow.style.gap = "10px";
+  statsHeaderRow.style.flexShrink = "0";
+
+  const statsTitleWrap = document.createElement("div");
+  statsTitleWrap.style.display = "flex";
+  statsTitleWrap.style.alignItems = "center";
+  statsTitleWrap.style.gap = "8px";
+  statsTitleWrap.appendChild(createSvgIcon(SVG_PATHS.chart, THEME.primary, 16));
+
+  const statsBannerTitle = document.createElement("div");
+  statsBannerTitle.style.fontSize = "13.5px";
+  statsBannerTitle.style.fontWeight = "700";
+  statsBannerTitle.style.color = THEME.successText;
+  statsTitleWrap.appendChild(statsBannerTitle);
+
+  const statsHeaderRight = document.createElement("div");
+  statsHeaderRight.style.display = "flex";
+  statsHeaderRight.style.alignItems = "center";
+  statsHeaderRight.style.gap = "8px";
+  statsHeaderRight.style.flexShrink = "0";
+
+  const statsTimeBadge = document.createElement("div");
+  statsTimeBadge.style.fontSize = "11px";
+  statsTimeBadge.style.fontWeight = "600";
+  statsTimeBadge.style.padding = "4px 8px";
+  statsTimeBadge.style.borderRadius = "6px";
+  statsTimeBadge.style.backgroundColor = THEME.subtleBg;
+  statsTimeBadge.style.border = `1px solid ${THEME.border}`;
+  statsTimeBadge.style.color = THEME.textSecondary;
+
+  const btnCopyReport = document.createElement("button");
+  btnCopyReport.textContent = "📋 Copy Stats Report";
+  btnCopyReport.style.padding = "4px 10px";
+  btnCopyReport.style.fontSize = "11.5px";
+  btnCopyReport.style.fontWeight = "600";
+  btnCopyReport.style.borderRadius = "6px";
+  btnCopyReport.style.border = `1px solid ${THEME.borderStrong}`;
+  btnCopyReport.style.backgroundColor = THEME.cardBg;
+  btnCopyReport.style.color = THEME.textMain;
+  btnCopyReport.style.cursor = "pointer";
+
+  statsHeaderRight.appendChild(statsTimeBadge);
+  statsHeaderRight.appendChild(btnCopyReport);
+  statsHeaderRow.appendChild(statsTitleWrap);
+  statsHeaderRow.appendChild(statsHeaderRight);
+  statsDashboard.appendChild(statsHeaderRow);
+
+  const statsSubMeta = document.createElement("div");
+  statsSubMeta.style.fontSize = "11.5px";
+  statsSubMeta.style.color = THEME.textSecondary;
+  statsSubMeta.style.padding = "6px 10px";
+  statsSubMeta.style.backgroundColor = THEME.appBg;
+  statsSubMeta.style.borderRadius = "6px";
+  statsSubMeta.style.border = `1px solid ${THEME.border}`;
+  statsSubMeta.style.flexShrink = "0";
+  statsDashboard.appendChild(statsSubMeta);
+
+  // KPI Metric Cards Row
+  const kpiCardsRow = document.createElement("div");
+  kpiCardsRow.style.display = "flex";
+  kpiCardsRow.style.flexWrap = "wrap";
+  kpiCardsRow.style.gap = "8px";
+  kpiCardsRow.style.flexShrink = "0";
+  statsDashboard.appendChild(kpiCardsRow);
+
+  // Expand / Collapse Toggle Button (Collapsed by Default!)
+  const expandToggleRow = document.createElement("div");
+  expandToggleRow.style.display = "flex";
+  expandToggleRow.style.justifyContent = "space-between";
+  expandToggleRow.style.alignItems = "center";
+  expandToggleRow.style.paddingTop = "4px";
+  expandToggleRow.style.flexShrink = "0";
+
+  const btnToggleBreakdown = document.createElement("button");
+  btnToggleBreakdown.textContent =
+    "🔽 Show Converted 3-Column Rows Preview (शब्द │ अर्थ │ पेज नं.)";
+  btnToggleBreakdown.style.width = "100%";
+  btnToggleBreakdown.style.padding = "8px 12px";
+  btnToggleBreakdown.style.fontSize = "12px";
+  btnToggleBreakdown.style.fontWeight = "600";
+  btnToggleBreakdown.style.borderRadius = "6px";
+  btnToggleBreakdown.style.border = `1px solid ${THEME.primaryBorder}`;
+  btnToggleBreakdown.style.backgroundColor = THEME.primarySoft;
+  btnToggleBreakdown.style.color = THEME.primary;
+  btnToggleBreakdown.style.cursor = "pointer";
+  btnToggleBreakdown.style.textAlign = "center";
+
+  expandToggleRow.appendChild(btnToggleBreakdown);
+  statsDashboard.appendChild(expandToggleRow);
+
+  let isBreakdownExpanded = false;
+  let currentBreakdownCount = 0;
+
+  const breakdownContainer = document.createElement("div");
+  breakdownContainer.style.display = "none"; // Default collapsed
+  breakdownContainer.style.flexDirection = "column";
+  breakdownContainer.style.gap = "6px";
+  breakdownContainer.style.maxHeight = "220px";
+  breakdownContainer.style.overflowY = "auto";
+  breakdownContainer.style.padding = "10px";
+  breakdownContainer.style.backgroundColor = THEME.appBg;
+  breakdownContainer.style.border = `1px solid ${THEME.borderStrong}`;
+  breakdownContainer.style.borderRadius = "8px";
+  breakdownContainer.style.flexShrink = "0";
+  statsDashboard.appendChild(breakdownContainer);
+
+  function setBreakdownExpanded(expanded) {
+    isBreakdownExpanded = Boolean(expanded);
+    if (isBreakdownExpanded) {
+      breakdownContainer.style.display = "flex";
+      btnToggleBreakdown.textContent = `🔼 Hide 3-Column Rows Preview (${currentBreakdownCount} rows — UI preview only, no header in output)`;
+      btnToggleBreakdown.style.backgroundColor = THEME.subtleBg;
+      btnToggleBreakdown.style.color = THEME.textMain;
+      btnToggleBreakdown.style.border = `1px solid ${THEME.borderStrong}`;
+    } else {
+      breakdownContainer.style.display = "none";
+      btnToggleBreakdown.textContent = `🔽 Show Converted 3-Column Rows Preview (${currentBreakdownCount} rows)`;
+      btnToggleBreakdown.style.backgroundColor = THEME.primarySoft;
+      btnToggleBreakdown.style.color = THEME.primary;
+      btnToggleBreakdown.style.border = `1px solid ${THEME.primaryBorder}`;
+    }
+  }
+
+  btnToggleBreakdown.addEventListener("click", () => {
+    setBreakdownExpanded(!isBreakdownExpanded);
+  });
+
+  container.appendChild(statsDashboard);
+
+  // --- 6. Action Buttons Row ---
+  const buttonRow = document.createElement("div");
+  buttonRow.style.display = "flex";
+  buttonRow.style.justifyContent = "space-between";
+  buttonRow.style.alignItems = "center";
+  buttonRow.style.marginTop = "2px";
+  buttonRow.style.flexShrink = "0";
+
+  const btnCopy3ColOnly = document.createElement("button");
+  btnCopy3ColOnly.textContent = "📋 Copy 3-Column Data (No Header)";
+  btnCopy3ColOnly.style.padding = "8px 14px";
+  btnCopy3ColOnly.style.borderRadius = "6px";
+  btnCopy3ColOnly.style.border = `1px solid ${THEME.primaryBorder}`;
+  btnCopy3ColOnly.style.backgroundColor = THEME.primarySoft;
+  btnCopy3ColOnly.style.color = THEME.primary;
+  btnCopy3ColOnly.style.fontWeight = "600";
+  btnCopy3ColOnly.style.fontSize = "12.5px";
+  btnCopy3ColOnly.style.cursor = "pointer";
+
+  const rightBtns = document.createElement("div");
+  rightBtns.style.display = "flex";
+  rightBtns.style.gap = "10px";
+
+  const btnClose = document.createElement("button");
+  btnClose.textContent = "✖ Close";
+  btnClose.style.padding = "8px 16px";
+  btnClose.style.borderRadius = "6px";
+  btnClose.style.border = `1px solid ${THEME.borderStrong}`;
+  btnClose.style.backgroundColor = THEME.cardBg;
+  btnClose.style.color = THEME.textSecondary;
+  btnClose.style.fontWeight = "600";
+  btnClose.style.fontSize = "12.5px";
+  btnClose.style.cursor = "pointer";
+
+  const btnConvert = document.createElement("button");
+  btnConvert.textContent = "⚡ Convert Selection to 3 Columns";
+  btnConvert.style.padding = "8px 20px";
+  btnConvert.style.borderRadius = "6px";
+  btnConvert.style.border = "none";
+  btnConvert.style.backgroundColor = THEME.primary;
+  btnConvert.style.color = "#FFFFFF";
+  btnConvert.style.fontWeight = "700";
+  btnConvert.style.fontSize = "12.5px";
+  btnConvert.style.cursor = "pointer";
+
+  rightBtns.appendChild(btnClose);
+  rightBtns.appendChild(btnConvert);
+  buttonRow.appendChild(btnCopy3ColOnly);
+  buttonRow.appendChild(rightBtns);
+  container.appendChild(buttonRow);
+
+  // --- 7. Workflow Tip & Credit Footer ---
+  const instructionsText = document.createElement("div");
+  instructionsText.textContent =
+    "💡 Tip for Existing Tables: Click '⚡ Convert Selection to 3 Columns' to convert your selected text into a 3-column headless table (all cells are auto-selected!). Press Cmd/Ctrl+C, click a cell in your existing table (शब्द | अर्थ | पेज नं.), and press Cmd/Ctrl+V to populate all 3 columns.";
+  instructionsText.style.fontSize = "11.5px";
+  instructionsText.style.lineHeight = "1.45";
+  instructionsText.style.color = THEME.textSecondary;
+  instructionsText.style.backgroundColor = THEME.subtleBg;
+  instructionsText.style.border = `1px solid ${THEME.border}`;
+  instructionsText.style.padding = "10px 12px";
+  instructionsText.style.borderRadius = "8px";
+  instructionsText.style.flexShrink = "0";
+  container.appendChild(instructionsText);
+
+  const creditText = document.createElement("div");
+  creditText.textContent = "Made with ❤️ by Rajesh Budhathoki";
+  creditText.style.textAlign = "center";
+  creditText.style.fontSize = "11.5px";
+  creditText.style.fontWeight = "500";
+  creditText.style.color = THEME.textMuted;
+  creditText.style.flexShrink = "0";
+  container.appendChild(creditText);
+
+  dialog.appendChild(container);
+  document.body.appendChild(dialog);
+
+  // --- Helper Functions ---
+  let latestReportText = "";
+  let latestParsed = null;
+
+  function getCurrentParse() {
+    const wDelim = wordDelimInput.value || "|";
+    const pDelim = pageDelimInput.value || "#";
+    const numMode = numSelect.value || "KEEP";
+    const sortPages = Boolean(chkSortPages.checked);
+
+    latestParsed = parseIndexLinesTo3Columns(
+      dataInput.value,
+      wDelim,
+      pDelim,
+      numMode,
+      sortPages
+    );
+
+    statValidRows.valEl.textContent = String(latestParsed.validRowCount);
+    statTotalCells.valEl.textContent = String(latestParsed.totalCellsCount);
+    statPageRefs.valEl.textContent = String(latestParsed.totalPageRefsCount);
+    statSkippedLines.valEl.textContent = String(
+      latestParsed.skippedDetails.length
+    );
+
+    return latestParsed;
+  }
+
+  function renderKpiCard(icon, title, value, textColor, bgColor, borderColor) {
+    const card = document.createElement("div");
+    card.style.display = "flex";
+    card.style.flexDirection = "column";
+    card.style.flex = "1";
+    card.style.minWidth = "96px";
+    card.style.padding = "8px 10px";
+    card.style.backgroundColor = bgColor || THEME.appBg;
+    card.style.border = `1px solid ${borderColor || THEME.border}`;
+    card.style.borderRadius = "6px";
+    card.style.flexShrink = "0";
+
+    const v = document.createElement("div");
+    v.textContent = `${icon} ${value}`;
+    v.style.fontSize = "14.5px";
+    v.style.fontWeight = "700";
+    v.style.color = textColor || THEME.textMain;
+
+    const t = document.createElement("div");
+    t.textContent = title;
+    t.style.fontSize = "10.5px";
+    t.style.fontWeight = "600";
+    t.style.color = THEME.textSecondary;
+    t.style.marginTop = "3px";
+
+    card.appendChild(v);
+    card.appendChild(t);
+    return card;
+  }
+
+  function renderConversionStatsOnUI(parsed, execInfo, copiedToClipboard) {
+    statsDashboard.style.display = "flex";
+    const sec = (execInfo.durationMs / 1000).toFixed(3);
+
+    statsBannerTitle.textContent = `✅ 3-Column Conversion Complete (${parsed.validRowCount} Rows × 3 Columns — No Header)`;
+    statsBannerTitle.style.color = THEME.successText;
+    statsTimeBadge.textContent = `⚡ ${sec}s (${execInfo.durationMs} ms)`;
+
+    statsSubMeta.textContent =
+      `📐 Method: ${execInfo.conversionMethod}   •   ` +
+      `📋 Clipboard: ${copiedToClipboard ? "Copied 3-Col Data" : "Not Copied"}   •   ` +
+      `🚫 Header Row: Omitted (Ready for Existing Table)`;
+
+    // 6 KPI Cards
+    kpiCardsRow.innerHTML = "";
+    kpiCardsRow.appendChild(
+      renderKpiCard(
+        "✅",
+        "Rows Converted",
+        parsed.validRowCount,
+        THEME.successText,
+        THEME.successBg,
+        THEME.successBorder
+      )
+    );
+    kpiCardsRow.appendChild(
+      renderKpiCard(
+        "🧱",
+        "3-Col Cells Built",
+        parsed.totalCellsCount,
+        THEME.infoText,
+        THEME.infoBg,
+        THEME.infoBorder
+      )
+    );
+    kpiCardsRow.appendChild(
+      renderKpiCard(
+        "🔖",
+        "Total Page Refs",
+        parsed.totalPageRefsCount,
+        THEME.warnText,
+        THEME.warnBg,
+        THEME.warnBorder
+      )
+    );
+    kpiCardsRow.appendChild(
+      renderKpiCard(
+        "📚",
+        "Multi-Page Terms",
+        parsed.multiPageRowsCount,
+        THEME.purpleText,
+        THEME.purpleBg,
+        THEME.purpleBorder
+      )
+    );
+    kpiCardsRow.appendChild(
+      renderKpiCard(
+        "📄",
+        "Single-Page Terms",
+        parsed.singlePageRowsCount,
+        "#0369A1",
+        "#E0F2FE",
+        "#7DD3FC"
+      )
+    );
+    kpiCardsRow.appendChild(
+      renderKpiCard(
+        "🧹",
+        "Skipped Lines",
+        parsed.skippedDetails.length,
+        parsed.skippedDetails.length > 0 ? THEME.warnText : THEME.textSecondary,
+        parsed.skippedDetails.length > 0 ? THEME.warnBg : THEME.subtleBg,
+        parsed.skippedDetails.length > 0 ? THEME.warnBorder : THEME.borderStrong
+      )
+    );
+
+    // Populate Collapsible 3-Column Preview Table (UI Visual Reference Only)
+    breakdownContainer.innerHTML = "";
+    currentBreakdownCount = parsed.rows.length;
+
+    // UI-Only Column Guide Banner inside Preview
+    const uiHeaderGuide = document.createElement("div");
+    uiHeaderGuide.style.display = "flex";
+    uiHeaderGuide.style.flexDirection = "row";
+    uiHeaderGuide.style.justifyContent = "space-between";
+    uiHeaderGuide.style.alignItems = "center";
+    uiHeaderGuide.style.padding = "6px 10px";
+    uiHeaderGuide.style.borderRadius = "6px";
+    uiHeaderGuide.style.backgroundColor = THEME.subtleBg;
+    uiHeaderGuide.style.border = `1px solid ${THEME.borderStrong}`;
+    uiHeaderGuide.style.fontSize = "11px";
+    uiHeaderGuide.style.fontWeight = "700";
+    uiHeaderGuide.style.color = THEME.textSecondary;
+    uiHeaderGuide.style.flexShrink = "0";
+
+    const hCol1 = document.createElement("div");
+    hCol1.textContent = "Col 1: शब्द (UI Guide Only)";
+    hCol1.style.width = "160px";
+    hCol1.style.flexShrink = "0";
+
+    const hCol2 = document.createElement("div");
+    hCol2.textContent = "Col 2: अर्थ (Meaning)";
+    hCol2.style.flex = "1";
+
+    const hCol3 = document.createElement("div");
+    hCol3.textContent = "Col 3: पेज नं.";
+    hCol3.style.width = "130px";
+    hCol3.style.textAlign = "right";
+    hCol3.style.flexShrink = "0";
+
+    uiHeaderGuide.appendChild(hCol1);
+    uiHeaderGuide.appendChild(hCol2);
+    uiHeaderGuide.appendChild(hCol3);
+    breakdownContainer.appendChild(uiHeaderGuide);
+
+    for (let i = 0; i < parsed.rows.length; i++) {
+      const r = parsed.rows[i];
+
+      const rowEl = document.createElement("div");
+      rowEl.style.display = "flex";
+      rowEl.style.flexDirection = "row";
+      rowEl.style.justifyContent = "space-between";
+      rowEl.style.alignItems = "center";
+      rowEl.style.gap = "10px";
+      rowEl.style.padding = "8px 10px";
+      rowEl.style.borderRadius = "6px";
+      rowEl.style.backgroundColor = THEME.cardBg;
+      rowEl.style.border = `1px solid ${THEME.border}`;
+      rowEl.style.flexShrink = "0";
+
+      // Column 1: Row Badge + शब्द
+      const colWordWrap = document.createElement("div");
+      colWordWrap.style.display = "flex";
+      colWordWrap.style.flexDirection = "row";
+      colWordWrap.style.alignItems = "center";
+      colWordWrap.style.gap = "8px";
+      colWordWrap.style.width = "160px";
+      colWordWrap.style.flexShrink = "0";
+
+      const numBadge = document.createElement("div");
+      numBadge.textContent = `#${r.rowNumber}`;
+      numBadge.style.fontSize = "10px";
+      numBadge.style.fontWeight = "700";
+      numBadge.style.padding = "2px 6px";
+      numBadge.style.borderRadius = "4px";
+      numBadge.style.backgroundColor = THEME.successBg;
+      numBadge.style.color = THEME.successText;
+      numBadge.style.border = `1px solid ${THEME.successBorder}`;
+      numBadge.style.flexShrink = "0";
+
+      const wordDiv = document.createElement("div");
+      wordDiv.textContent = r.word;
+      wordDiv.style.fontSize = "12.5px";
+      wordDiv.style.fontWeight = "700";
+      wordDiv.style.color = THEME.textMain;
+
+      colWordWrap.appendChild(numBadge);
+      colWordWrap.appendChild(wordDiv);
+
+      // Column 2: अर्थ
+      const colMeaning = document.createElement("div");
+      colMeaning.textContent = r.meaning;
+      colMeaning.style.flex = "1";
+      colMeaning.style.fontSize = "12px";
+      colMeaning.style.color = THEME.textSecondary;
+      colMeaning.style.lineHeight = "1.35";
+
+      // Column 3: पेज नं.
+      const colPages = document.createElement("div");
+      colPages.textContent = r.pages ? `📄 ${r.pages}` : "—";
+      colPages.style.fontSize = "11.5px";
+      colPages.style.fontWeight = "700";
+      colPages.style.padding = "4px 8px";
+      colPages.style.borderRadius = "6px";
+      colPages.style.backgroundColor = THEME.primarySoft;
+      colPages.style.color = THEME.primary;
+      colPages.style.border = `1px solid ${THEME.primaryBorder}`;
+      colPages.style.flexShrink = "0";
+
+      rowEl.appendChild(colWordWrap);
+      rowEl.appendChild(colMeaning);
+      rowEl.appendChild(colPages);
+      breakdownContainer.appendChild(rowEl);
+    }
+
+    // Default to collapsed so UI remains clean and compact
+    setBreakdownExpanded(false);
+
+    // Build text report
+    const reportLines = [
+      "=== InDesign 3-Column Glossary Conversion Report ===",
+      `Document: ${doc.name}`,
+      `Method: ${execInfo.conversionMethod}`,
+      `Duration: ${sec}s (${execInfo.durationMs} ms)`,
+      `Rows Converted: ${parsed.validRowCount} | Cells Generated: ${parsed.totalCellsCount}`,
+      `Total Page References: ${parsed.totalPageRefsCount} | Skipped Lines: ${parsed.skippedDetails.length}`,
+      "",
+      "--- Converted 3-Column Data (शब्द \\t अर्थ \\t पेज नं.) ---",
+      parsed.clipboardTabString,
+    ];
+    latestReportText = reportLines.join("\n");
+  }
+
+  // Initial parse on open
+  getCurrentParse();
+
+  // Live update listeners
+  dataInput.addEventListener("input", getCurrentParse);
+  wordDelimInput.addEventListener("input", getCurrentParse);
+  pageDelimInput.addEventListener("input", getCurrentParse);
+  numSelect.addEventListener("change", getCurrentParse);
+  chkSortPages.addEventListener("change", getCurrentParse);
+
+  // Reload from InDesign Selection button
+  btnReloadSelection.addEventListener("click", async () => {
+    selectionInfo = resolveSelectedTextTarget(doc);
+    if (selectionInfo.target && selectionInfo.text.trim().length > 0) {
+      dataInput.value = selectionInfo.text;
+      selBadge.textContent = `🎯 ${selectionInfo.typeLabel}`;
+      selBadge.style.backgroundColor = THEME.successBg;
+      selBadge.style.border = `1px solid ${THEME.successBorder}`;
+      selBadge.style.color = THEME.successText;
+      getCurrentParse();
+    } else {
+      await showAlertDialog(
+        "No Text Selected",
+        "Please select a text range or text frame in your InDesign document first.",
+        dialog
+      );
+    }
+  });
+
+  // Copy 3-Column Tab-Separated Data (No Header) directly to clipboard
+  btnCopy3ColOnly.addEventListener("click", async () => {
+    const parsed = getCurrentParse();
+    if (parsed.validRowCount === 0) {
+      await showAlertDialog(
+        "No Valid Rows",
+        "No valid 'Word | Meaning #Pages' lines found to copy.",
+        dialog
+      );
+      return;
+    }
+
+    let copied = false;
+    try {
+      if (navigator && navigator.clipboard && navigator.clipboard.writeText) {
+        await navigator.clipboard.writeText(parsed.clipboardTabString);
+        copied = true;
+      }
+    } catch (e) {}
+
+    if (copied) {
+      btnCopy3ColOnly.textContent = `✅ Copied ${parsed.validRowCount}×3 Cells!`;
+      setTimeout(() => {
+        btnCopy3ColOnly.textContent = "📋 Copy 3-Column Data (No Header)";
+      }, 1800);
+    }
+
+    renderConversionStatsOnUI(
+      parsed,
+      {
+        durationMs: 2,
+        conversionMethod: "Copied 3-Column Tab-Separated Data (No Header)",
+      },
+      copied
+    );
+  });
+
+  // Copy Report Handler
+  btnCopyReport.addEventListener("click", async () => {
+    if (!latestReportText) return;
+    try {
+      if (navigator && navigator.clipboard && navigator.clipboard.writeText) {
+        await navigator.clipboard.writeText(latestReportText);
+        btnCopyReport.textContent = "✅ Copied!";
+        setTimeout(() => {
+          btnCopyReport.textContent = "📋 Copy Stats Report";
+        }, 1500);
+        return;
+      }
+    } catch (e) {}
+    await showAlertDialog("Conversion Report", latestReportText, dialog);
+  });
+
+  // Main Convert Selection Button Handler
+  btnConvert.addEventListener("click", async () => {
+    const parsed = getCurrentParse();
+
+    if (parsed.validRowCount === 0) {
+      await showAlertDialog(
+        "No Valid Lines Found",
+        "Please ensure your text contains lines formatted like:\nअक्षय | कहिल्यै क्षय नहुने वा नसकिने #40, 191",
+        dialog
+      );
+      return;
+    }
+
+    let copied = false;
+    if (chkAutoCopy.checked) {
+      try {
+        if (navigator && navigator.clipboard && navigator.clipboard.writeText) {
+          await navigator.clipboard.writeText(parsed.clipboardTabString);
+          copied = true;
+        }
+      } catch (e) {}
+    }
+
+    // Check if there is an active selection in InDesign to convert in-place
+    selectionInfo = resolveSelectedTextTarget(doc);
+    if (!selectionInfo.target) {
+      renderConversionStatsOnUI(
+        parsed,
+        {
+          durationMs: 3,
+          conversionMethod:
+            "Clipboard 3-Column Output (No InDesign Selection Active)",
+        },
+        copied
+      );
+      await showAlertDialog(
+        "3-Column Data Ready on Clipboard",
+        `Converted ${parsed.validRowCount} rows into 3 headless columns (शब्द | अर्थ | पेज नं.) and copied to clipboard.\n\nTip: If you want the script to convert text directly on the page into a 3-column table, highlight the text in InDesign before running the script.`,
+        dialog
+      );
+      return;
+    }
+
+    btnConvert.textContent = "⏳ Converting...";
+    btnConvert.disabled = true;
+
+    try {
+      const outputMode = modeSelect.value || "TABLE_NO_HEADER";
+      const execInfo = executeInDesignConversion(
+        doc,
+        selectionInfo,
+        parsed,
+        outputMode
+      );
+      renderConversionStatsOnUI(parsed, execInfo, copied);
+    } catch (err) {
+      await showAlertDialog(
+        "Conversion Notice",
+        String(err && err.message ? err.message : err),
+        dialog
+      );
+    } finally {
+      btnConvert.textContent = "⚡ Convert Selection to 3 Columns";
+      btnConvert.disabled = false;
+    }
+  });
+
+  // Keep Dialog Open Until User Clicks "Close" or Escapes
+  await new Promise((resolve) => {
+    let closed = false;
+    const closeMainDialog = () => {
+      if (closed) return;
+      closed = true;
+      try {
+        dialog.close();
+      } catch (e) {}
+      try {
+        dialog.remove();
+      } catch (e) {}
+      resolve();
+    };
+
+    btnClose.addEventListener("click", closeMainDialog);
+    dialog.addEventListener("cancel", closeMainDialog);
+    dialog.showModal();
+  });
+}
+
+await main();

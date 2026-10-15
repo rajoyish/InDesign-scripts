@@ -1,0 +1,763 @@
+/**
+ * @name ConvertGlossaryTableToText.idjs
+ * @version 2.0.0
+ * @description High-performance Adobe InDesign UXP script (v18.0+) that converts
+ *              selected glossary tables (including Devanagari/Nepali text) into
+ *              a clean, single-line "Word | Meaning" format for AddGlossaryTopics.jsx.
+ *
+ * Key Fixes & Optimizations:
+ *  - Bulk DOM read via `table.cells.everyItem().contents` (zero cell-by-cell DOM loops)
+ *  - Strips cell-internal/trailing \r, \n, \t, and soft returns that split "Word" and "| Meaning"
+ *  - Sanitizes internal ASCII pipes ("|") to Devanagari Purnavirama ("।", \u0964)
+ *  - Preserves Devanagari ZWNJ (\u200C) and ZWJ (\u200D) while stripping ~I / \uFEFF markers
+ *  - Skips HeaderRows & common Nepali/English header labels ("शब्द | अर्थ", "Word | Meaning")
+ *  - Filters empty/incomplete rows, removes exact duplicates, and flags duplicate headwords
+ *  - Single-step Undo support via `app.doScript(..., UndoModes.ENTIRE_SCRIPT)`
+ */
+
+const { app, UndoModes, ScriptLanguage, RowTypes } = require("indesign");
+
+// ============================================================================
+// 1. DEFAULT CONFIGURATION & CONSTANTS
+// ============================================================================
+
+const DEFAULT_CONFIG = {
+    skipHeaderRows: true,          // Skip InDesign HeaderRows + auto-detected "शब्द | अर्थ" / "Word | Meaning"
+    forceSkipFirstRow: false,      // Always skip the first row of every table regardless of content
+    removeExactDuplicates: true,   // Deduplicate identical "Word | Meaning" lines
+    doubleSpacedOutput: false,     // false = single-spaced ("Word | Meaning\r"), true = blank line between entries
+    replaceInPlace: true,          // Replace the table in the InDesign story with converted text
+    showCompletionDialog: true,    // Show post-run statistics & copyable "Word | Meaning" output preview
+    multiColumnJoiner: "; "        // Joiner when merging non-empty cells in tables with >2 columns
+};
+
+// Known glossary header tokens (normalized lowercase / Devanagari)
+const HEADER_WORDS = new Set([
+    "शब्द", "मूल शब्द", "पद", "शब्दावली", "शीर्षक",
+    "word", "words", "term", "terms", "headword", "entry", "topic"
+]);
+
+const HEADER_MEANINGS = new Set([
+    "अर्थ", "परिभाषा", "व्याख्या", "विवरण", "भावार्थ",
+    "meaning", "meanings", "definition", "definitions", "description", "gloss"
+]);
+
+// ============================================================================
+// 2. SMART TABLE SELECTION DETECTION
+// ============================================================================
+
+/**
+ * Resolves one or more unique InDesign Table objects from any user selection:
+ * Table, Cell, Row, Column, InsertionPoint/Text/Word/Paragraph inside a cell,
+ * or a TextFrame/Story containing one or more tables.
+ *
+ * @returns {Array<Table>} Deduplicated array of Table objects sorted in reverse story order.
+ */
+function resolveSelectedTables() {
+    if (!app.documents.length) {
+        throw new Error("No InDesign document is currently open.");
+    }
+
+    const selection = app.selection;
+    if (!selection || selection.length === 0) {
+        throw new Error(
+            "Nothing is selected.\n\nPlease place your cursor inside a glossary table, select cells/rows, or select a text frame containing a table."
+        );
+    }
+
+    const tableMap = new Map(); // Keyed by table.id to prevent duplicate processing
+
+    function addTable(tableObj) {
+        if (tableObj && tableObj.isValid && !tableMap.has(tableObj.id)) {
+            tableMap.set(tableObj.id, tableObj);
+        }
+    }
+
+    function extractTablesFromItem(item) {
+        if (!item || !item.isValid) return;
+
+        const typeName = item.constructor.name;
+
+        // Case 1: Direct Table selection
+        if (typeName === "Table") {
+            addTable(item);
+            return;
+        }
+
+        // Case 2: Cell, Row, or Column inside a Table
+        if (typeName === "Cell" || typeName === "Row" || typeName === "Column") {
+            let curr = item.parent;
+            while (curr && curr.isValid) {
+                if (curr.constructor.name === "Table") {
+                    addTable(curr);
+                    return;
+                }
+                curr = curr.parent;
+            }
+        }
+
+        // Case 3: Text selection / InsertionPoint inside a Cell, or containing nested Tables
+        let parentWalk = item.parent;
+        while (parentWalk && parentWalk.isValid) {
+            const pName = parentWalk.constructor.name;
+            if (pName === "Table") {
+                addTable(parentWalk);
+                return;
+            }
+            if (pName === "Story" || pName === "Document" || pName === "Application") {
+                break;
+            }
+            parentWalk = parentWalk.parent;
+        }
+
+        // Case 4: TextFrame, Story, or highlighted Text range containing 1+ Tables
+        if (item.tables && item.tables.length > 0) {
+            const embeddedTables = item.tables.everyItem().getElements();
+            for (let i = 0; i < embeddedTables.length; i++) {
+                addTable(embeddedTables[i]);
+            }
+        }
+    }
+
+    for (let i = 0; i < selection.length; i++) {
+        extractTablesFromItem(selection[i]);
+    }
+
+    const tables = Array.from(tableMap.values());
+
+    // Sort tables in reverse story offset order so in-place replacement of multiple
+    // tables in the same story never shifts earlier character indices.
+    tables.sort((a, b) => {
+        try {
+            const storyA = a.storyOffset.parentStory.id;
+            const storyB = b.storyOffset.parentStory.id;
+            if (storyA !== storyB) return storyB - storyA;
+            return b.storyOffset.index - a.storyOffset.index;
+        } catch (_) {
+            return 0;
+        }
+    });
+
+    return tables;
+}
+
+// ============================================================================
+// 3. HIGH-SPEED STRING CLEANING & DEVANAGARI NORMALIZATION
+// ============================================================================
+
+// Regex patterns compiled once for maximum throughput
+const RE_LINE_BREAKS = /[\r\n\t\u000B\u000C\u2028\u2029]+/g;
+const RE_INDESIGN_MARKERS = /(?:\uFEFF|~I|[\u0000-\u0008\u000E-\u001F\uFFFC])/g;
+// Collapses ASCII space, NBSP (\u00A0), and Unicode spaces while strictly preserving ZWNJ (\u200C) and ZWJ (\u200D)
+const RE_HORIZONTAL_SPACES = /[ \u00A0\u1680\u2000-\u200A\u202F\u205F\u3000]+/g;
+const RE_INTERNAL_PIPE = /\|/g;
+
+/**
+ * Cleans a raw cell string in memory and records error telemetry.
+ *
+ * @param {string} rawText
+ * @param {Object} stats
+ * @returns {{ text: string, hadLineBreak: boolean, pipesFixed: number }}
+ */
+function sanitizeCellText(rawText, stats) {
+    if (rawText === null || rawText === undefined) {
+        return { text: "", hadLineBreak: false, pipesFixed: 0 };
+    }
+
+    let str = String(rawText);
+    if (str.length === 0) {
+        return { text: "", hadLineBreak: false, pipesFixed: 0 };
+    }
+
+    // 1. Strip stray InDesign index markers (~I / \uFEFF / special control chars)
+    //    Note: \u200C (ZWNJ) and \u200D (ZWJ) are outside these ranges and remain intact.
+    if (RE_INDESIGN_MARKERS.test(str)) {
+        RE_INDESIGN_MARKERS.lastIndex = 0;
+        str = str.replace(RE_INDESIGN_MARKERS, "");
+        stats.specialMarkersStripped++;
+    }
+
+    // 2. Detect & fix broken line wraps (\r, \n, \t) inside the cell
+    let hadLineBreak = false;
+    if (RE_LINE_BREAKS.test(str)) {
+        hadLineBreak = true;
+        RE_LINE_BREAKS.lastIndex = 0;
+        str = str.replace(RE_LINE_BREAKS, " ");
+        stats.brokenLineCellsFixed++;
+    }
+
+    // 3. Sanitize internal ASCII pipes ("|") -> Devanagari Purnavirama ("।", \u0964)
+    let pipesFixed = 0;
+    if (str.indexOf("|") !== -1) {
+        const matches = str.match(RE_INTERNAL_PIPE);
+        pipesFixed = matches ? matches.length : 0;
+        str = str.replace(RE_INTERNAL_PIPE, "\u0964");
+        stats.internalPipesFixed += pipesFixed;
+    }
+
+    // 4. Normalize consecutive horizontal spaces into a single standard space and trim
+    str = str.replace(RE_HORIZONTAL_SPACES, " ").trim();
+
+    return { text: str, hadLineBreak, pipesFixed };
+}
+
+/**
+ * Checks whether a 1st row represents a glossary header row (e.g. "शब्द | अर्थ" or "Word | Meaning").
+ */
+function isGlossaryHeaderRow(word, meaning) {
+    const normWord = word.toLowerCase().replace(/[:：।.]/g, "").trim();
+    const normMeaning = meaning.toLowerCase().replace(/[:：।.]/g, "").trim();
+
+    if (HEADER_WORDS.has(normWord) && HEADER_MEANINGS.has(normMeaning)) {
+        return true;
+    }
+    if (normWord === "शब्द" || normWord === "word" || normWord === "term") {
+        return true;
+    }
+    return false;
+}
+
+// ============================================================================
+// 4. BATCH TABLE EXTRACTION & PROCESSING ENGINE
+// ============================================================================
+
+/**
+ * Extracts all cells from a Table in a single bulk DOM read, cleans rows in memory,
+ * and optionally replaces the table in-place.
+ *
+ * @param {Table} table
+ * @param {Object} config
+ * @param {Object} stats
+ * @param {Set<string>} seenEntries
+ * @param {Map<string, Set<string>>} headwordMeaningsMap
+ * @returns {Array<string>} Converted "Word | Meaning" lines for this table
+ */
+function processSingleTable(table, config, stats, seenEntries, headwordMeaningsMap) {
+    const rowCount = table.rows.length;
+    const colCount = table.columns.length;
+
+    if (rowCount === 0 || colCount === 0) return [];
+
+    // Single bulk DOM reads
+    const allCellContents = table.cells.everyItem().contents;
+    let rowTypes = [];
+    try {
+        rowTypes = table.rows.everyItem().rowType;
+    } catch (_) {
+        rowTypes = new Array(rowCount).fill(null);
+    }
+
+    // Build a 2D array of raw cell contents per row.
+    // Fast path: unmerged rectangular grid (allCellContents.length === rowCount * colCount).
+    // Safe fallback: if merged cells exist, query each row's cells in bulk.
+    const rawRows = new Array(rowCount);
+    if (allCellContents.length === rowCount * colCount) {
+        for (let r = 0; r < rowCount; r++) {
+            const offset = r * colCount;
+            rawRows[r] = allCellContents.slice(offset, offset + colCount);
+        }
+    } else {
+        const rowElements = table.rows.everyItem().getElements();
+        for (let r = 0; r < rowElements.length; r++) {
+            rawRows[r] = rowElements[r].cells.everyItem().contents;
+        }
+    }
+
+    const tableOutputLines = [];
+    let firstBodyRowChecked = false;
+
+    for (let r = 0; r < rowCount; r++) {
+        stats.totalRowsScanned++;
+
+        // 1. Check native InDesign Header / Footer row type
+        const rType = rowTypes[r];
+        const isNativeHeaderOrFooter =
+            RowTypes &&
+            (rType === RowTypes.HEADER_ROW || rType === RowTypes.FOOTER_ROW);
+
+        if (config.skipHeaderRows && isNativeHeaderOrFooter) {
+            stats.headerRowsSkipped++;
+            continue;
+        }
+
+        // 2. Clean all cells in the current row
+        const rowCells = rawRows[r] || [];
+        let rowHadLineBreak = false;
+        const cleanedCells = new Array(rowCells.length);
+
+        for (let c = 0; c < rowCells.length; c++) {
+            const cleaned = sanitizeCellText(rowCells[c], stats);
+            cleanedCells[c] = cleaned.text;
+            if (cleaned.hadLineBreak) rowHadLineBreak = true;
+        }
+
+        if (rowHadLineBreak) {
+            stats.brokenLineRowsFixed++;
+        }
+
+        // Extract Word (Col 0) and Meaning (Col 1..N merged if >2 columns)
+        const word = cleanedCells.length > 0 ? cleanedCells[0] : "";
+        let meaning = "";
+        if (cleanedCells.length === 2) {
+            meaning = cleanedCells[1];
+        } else if (cleanedCells.length > 2) {
+            const meaningParts = [];
+            for (let c = 1; c < cleanedCells.length; c++) {
+                if (cleanedCells[c].length > 0) {
+                    meaningParts.push(cleanedCells[c]);
+                }
+            }
+            meaning = meaningParts.join(config.multiColumnJoiner);
+            if (meaningParts.length > 1) {
+                stats.multiColumnRowsMerged++;
+            }
+        }
+
+        // 3. Check if row is completely empty
+        if (word.length === 0 && meaning.length === 0) {
+            stats.emptyRowsSkipped++;
+            continue;
+        }
+
+        // 4. Check first non-empty body row for header labels ("शब्द | अर्थ" / "Word | Meaning")
+        if (!firstBodyRowChecked) {
+            firstBodyRowChecked = true;
+            if (
+                config.forceSkipFirstRow ||
+                (config.skipHeaderRows && isGlossaryHeaderRow(word, meaning))
+            ) {
+                stats.headerRowsSkipped++;
+                continue;
+            }
+        }
+
+        // 5. Filter incomplete rows (missing Word or missing Meaning)
+        if (word.length === 0 || meaning.length === 0) {
+            stats.incompleteRowsSkipped++;
+            stats.incompleteRowDetails.push(
+                `Row ${r + 1}: "${word || "<EMPTY WORD>"}" | "${meaning || "<EMPTY MEANING>"}"`
+            );
+            continue;
+        }
+
+        // 6. Construct guaranteed single-pipe line
+        const formattedLine = `${word} | ${meaning}`;
+
+        // 7. Check exact duplicates ("Word | Meaning")
+        if (seenEntries.has(formattedLine)) {
+            stats.exactDuplicatesFound++;
+            if (config.removeExactDuplicates) {
+                stats.exactDuplicatesRemoved++;
+                continue;
+            }
+        } else {
+            seenEntries.add(formattedLine);
+        }
+
+        // 8. Track duplicate headwords with different meanings
+        if (!headwordMeaningsMap.has(word)) {
+            headwordMeaningsMap.set(word, new Set([meaning]));
+        } else {
+            headwordMeaningsMap.get(word).add(meaning);
+        }
+
+        tableOutputLines.push(formattedLine);
+        stats.validEntriesConverted++;
+    }
+
+    // 9. Replace table in-place in the story in a single DOM write if enabled
+    if (config.replaceInPlace && tableOutputLines.length > 0) {
+        const paragraphJoiner = config.doubleSpacedOutput ? "\r\r" : "\r";
+        const storyReplacementText = tableOutputLines.join(paragraphJoiner) + "\r";
+
+        const storyOffset = table.storyOffset;
+        const parentStory = storyOffset.parentStory;
+        const charIndex = storyOffset.index;
+
+        table.remove();
+        parentStory.insertionPoints.item(charIndex).contents = storyReplacementText;
+    }
+
+    return tableOutputLines;
+}
+
+// ============================================================================
+// 5. UI DIALOGS (UXP HTML <dialog> WITH NATIVE INDESIGN DIALOG FALLBACK)
+// ============================================================================
+
+/**
+ * Displays the Pre-Run Configuration Dialog.
+ * Uses UXP HTML <dialog> if supported, falling back to InDesign's native `app.dialogs`.
+ *
+ * @param {number} tableCount
+ * @returns {Promise<Object|null>} Resolved user config object, or null if canceled.
+ */
+async function showPreRunConfigDialog(tableCount) {
+    // Try UXP HTML <dialog> first
+    if (typeof document !== "undefined" && typeof document.createElement === "function") {
+        try {
+            return await new Promise((resolve) => {
+                const dialog = document.createElement("dialog");
+                dialog.style.padding = "20px";
+                dialog.style.width = "440px";
+                dialog.style.fontFamily = "system-ui, sans-serif";
+                dialog.style.fontSize = "13px";
+
+                dialog.innerHTML = `
+                    <form method="dialog" style="display:flex; flex-direction:column; gap:12px;">
+                        <h3 style="margin:0 0 4px 0; font-size:16px;">Glossary Table to "Word | Meaning" Converter</h3>
+                        <div style="color:#666; margin-bottom:4px;">
+                            Target Tables Detected: <strong>${tableCount}</strong>
+                        </div>
+
+                        <label style="display:flex; align-items:center; gap:8px;">
+                            <input type="checkbox" id="chkSkipHeaders" checked />
+                            <span>Auto-skip Header Rows (<code>HeaderRow</code> &amp; <code>शब्द | अर्थ</code> / <code>Word | Meaning</code>)</span>
+                        </label>
+
+                        <label style="display:flex; align-items:center; gap:8px;">
+                            <input type="checkbox" id="chkForceFirst" />
+                            <span>Always skip Row 1 of every table</span>
+                        </label>
+
+                        <label style="display:flex; align-items:center; gap:8px;">
+                            <input type="checkbox" id="chkDedup" checked />
+                            <span>Remove exact duplicate <code>Word | Meaning</code> entries</span>
+                        </label>
+
+                        <div style="display:flex; flex-direction:column; gap:4px; margin-top:4px;">
+                            <span style="font-weight:600;">Line Spacing:</span>
+                            <select id="selSpacing" style="padding:4px;">
+                                <option value="single" selected>Single-spaced (Word | Meaning on consecutive lines)</option>
+                                <option value="double">Double-spaced (Blank paragraph between entries)</option>
+                            </select>
+                        </div>
+
+                        <div style="display:flex; flex-direction:column; gap:4px; margin-top:4px;">
+                            <span style="font-weight:600;">Output Mode:</span>
+                            <select id="selOutputMode" style="padding:4px;">
+                                <option value="both" selected>Replace Table In-Place &amp; Show Copyable Preview</option>
+                                <option value="previewOnly">Show Copyable Preview Only (Keep Table Intact)</option>
+                                <option value="replaceOnly">Replace Table In-Place Only</option>
+                            </select>
+                        </div>
+
+                        <div style="display:flex; justify-content:flex-end; gap:8px; margin-top:14px;">
+                            <sp-button id="btnCancel" variant="secondary">Cancel</sp-button>
+                            <sp-button id="btnRun" variant="cta">Convert Glossary</sp-button>
+                        </div>
+                    </form>
+                `;
+
+                document.body.appendChild(dialog);
+
+                const btnCancel = dialog.querySelector("#btnCancel");
+                const btnRun = dialog.querySelector("#btnRun");
+
+                const finish = (result) => {
+                    dialog.close();
+                    dialog.remove();
+                    resolve(result);
+                };
+
+                btnCancel.addEventListener("click", () => finish(null));
+                btnRun.addEventListener("click", () => {
+                    const mode = dialog.querySelector("#selOutputMode").value;
+                    finish({
+                        ...DEFAULT_CONFIG,
+                        skipHeaderRows: dialog.querySelector("#chkSkipHeaders").checked,
+                        forceSkipFirstRow: dialog.querySelector("#chkForceFirst").checked,
+                        removeExactDuplicates: dialog.querySelector("#chkDedup").checked,
+                        doubleSpacedOutput: dialog.querySelector("#selSpacing").value === "double",
+                        replaceInPlace: mode === "both" || mode === "replaceOnly",
+                        showCompletionDialog: mode === "both" || mode === "previewOnly"
+                    });
+                });
+
+                dialog.showModal();
+            });
+        } catch (_) {
+            // Fall through to native InDesign dialog below if HTML modal fails
+        }
+    }
+
+    // Fallback: Native InDesign `app.dialogs` API
+    const dlg = app.dialogs.add({
+        name: `Convert Glossary Table (${tableCount} Table${tableCount > 1 ? "s" : ""} Selected)`
+    });
+
+    const col = dlg.dialogColumns.add();
+    const chkSkipHeaders = col.checkboxControls.add({
+        staticLabel: "Auto-skip Header Rows (HeaderRow & शब्द | अर्थ / Word | Meaning)",
+        checkedState: DEFAULT_CONFIG.skipHeaderRows
+    });
+    const chkForceFirst = col.checkboxControls.add({
+        staticLabel: "Always skip Row 1 of every table",
+        checkedState: DEFAULT_CONFIG.forceSkipFirstRow
+    });
+    const chkDedup = col.checkboxControls.add({
+        staticLabel: "Remove exact duplicate 'Word | Meaning' entries",
+        checkedState: DEFAULT_CONFIG.removeExactDuplicates
+    });
+    const chkDoubleSpace = col.checkboxControls.add({
+        staticLabel: "Double-spaced output (blank paragraph between entries)",
+        checkedState: DEFAULT_CONFIG.doubleSpacedOutput
+    });
+    const chkReplaceInPlace = col.checkboxControls.add({
+        staticLabel: "Replace table in-place in document story",
+        checkedState: DEFAULT_CONFIG.replaceInPlace
+    });
+
+    const accepted = dlg.show();
+    if (!accepted) {
+        dlg.destroy();
+        return null;
+    }
+
+    const config = {
+        ...DEFAULT_CONFIG,
+        skipHeaderRows: chkSkipHeaders.checkedState,
+        forceSkipFirstRow: chkForceFirst.checkedState,
+        removeExactDuplicates: chkDedup.checkedState,
+        doubleSpacedOutput: chkDoubleSpace.checkedState,
+        replaceInPlace: chkReplaceInPlace.checkedState,
+        showCompletionDialog: true
+    };
+    dlg.destroy();
+    return config;
+}
+
+/**
+ * Displays the Post-Run Statistics & Scrollable Copy-Ready Output Dialog.
+ *
+ * @param {Object} stats
+ * @param {string} previewText
+ */
+async function showCompletionReportDialog(stats, previewText) {
+    const dupHeadwordSummary =
+        stats.duplicateHeadwords.length > 0
+            ? `${stats.duplicateHeadwords.length} (${stats.duplicateHeadwords.slice(0, 8).join(", ")}${
+                  stats.duplicateHeadwords.length > 8 ? "..." : ""
+              })`
+            : "0";
+
+    const incompleteSummary =
+        stats.incompleteRowDetails.length > 0
+            ? `\nIncomplete Rows Skipped:\n  - ${stats.incompleteRowDetails.slice(0, 5).join("\n  - ")}${
+                  stats.incompleteRowDetails.length > 5 ? "\n  - ..." : ""
+              }`
+            : "";
+
+    // Try UXP HTML <dialog> with a scrollable copyable <textarea>
+    if (typeof document !== "undefined" && typeof document.createElement === "function") {
+        try {
+            await new Promise((resolve) => {
+                const dialog = document.createElement("dialog");
+                dialog.style.padding = "20px";
+                dialog.style.width = "620px";
+                dialog.style.fontFamily = "system-ui, sans-serif";
+                dialog.style.fontSize = "13px";
+
+                dialog.innerHTML = `
+                    <div style="display:flex; flex-direction:column; gap:10px;">
+                        <h3 style="margin:0; font-size:16px;">Glossary Conversion Complete</h3>
+
+                        <div style="display:grid; grid-template-columns: 1fr 1fr; gap:6px 16px; background:#f5f5f5; padding:10px 12px; border-radius:6px; color:#222;">
+                            <div>Tables Processed: <strong>${stats.tablesProcessed}</strong></div>
+                            <div>Execution Time: <strong>${stats.executionTimeMs} ms</strong></div>
+                            <div>Total Rows Scanned: <strong>${stats.totalRowsScanned}</strong></div>
+                            <div>Valid Entries Converted: <strong style="color:#0a7d33;">${stats.validEntriesConverted}</strong></div>
+                            <div>Broken Line/Return Cells Fixed: <strong>${stats.brokenLineCellsFixed} (${stats.brokenLineRowsFixed} rows)</strong></div>
+                            <div>Internal Pipes (<code>|</code> &rarr; <code>।</code>) Fixed: <strong>${stats.internalPipesFixed}</strong></div>
+                            <div>Header Rows Skipped: <strong>${stats.headerRowsSkipped}</strong></div>
+                            <div>Empty / Incomplete Skipped: <strong>${stats.emptyRowsSkipped} empty / ${stats.incompleteRowsSkipped} incomplete</strong></div>
+                            <div>Exact Duplicates Removed: <strong>${stats.exactDuplicatesRemoved}</strong></div>
+                            <div>Duplicate Headwords: <strong>${dupHeadwordSummary}</strong></div>
+                        </div>
+
+                        <div style="display:flex; justify-content:space-between; align-items:center; margin-top:4px;">
+                            <span style="font-weight:600;">Copy-Ready <code>Word | Meaning</code> Output (${stats.validEntriesConverted} lines):</span>
+                            <span id="copyStatus" style="color:#0a7d33; font-size:12px;"></span>
+                        </div>
+
+                        <textarea id="txtOutput" readonly style="width:100%; height:240px; font-family:monospace; font-size:12px; padding:8px; white-space:pre; overflow:auto; border:1px solid #ccc; border-radius:4px;"></textarea>
+
+                        <div style="display:flex; justify-content:flex-end; gap:8px; margin-top:8px;">
+                            <sp-button id="btnSelectAll" variant="secondary">Select &amp; Copy All</sp-button>
+                            <sp-button id="btnClose" variant="cta">Done</sp-button>
+                        </div>
+                    </div>
+                `;
+
+                document.body.appendChild(dialog);
+
+                const txtArea = dialog.querySelector("#txtOutput");
+                txtArea.value = previewText;
+
+                const copyStatus = dialog.querySelector("#copyStatus");
+                const btnSelectAll = dialog.querySelector("#btnSelectAll");
+                const btnClose = dialog.querySelector("#btnClose");
+
+                btnSelectAll.addEventListener("click", async () => {
+                    txtArea.focus();
+                    txtArea.select();
+                    try {
+                        if (navigator.clipboard && navigator.clipboard.writeText) {
+                            await navigator.clipboard.writeText(previewText);
+                            copyStatus.textContent = "Copied to clipboard!";
+                        } else {
+                            document.execCommand("copy");
+                            copyStatus.textContent = "Selected & copied!";
+                        }
+                    } catch (_) {
+                        copyStatus.textContent = "Text selected — press Ctrl+C / Cmd+C to copy.";
+                    }
+                });
+
+                btnClose.addEventListener("click", () => {
+                    dialog.close();
+                    dialog.remove();
+                    resolve();
+                });
+
+                dialog.showModal();
+            });
+            return;
+        } catch (_) {
+            // Fall through to native alert report if HTML dialog is unavailable
+        }
+    }
+
+    // Fallback summary report
+    const reportLines = [
+        "=== GLOSSARY TABLE CONVERSION REPORT ===",
+        `Tables Processed: ${stats.tablesProcessed}`,
+        `Total Rows Scanned: ${stats.totalRowsScanned}`,
+        `Valid 'Word | Meaning' Entries: ${stats.validEntriesConverted}`,
+        `Broken Line/Return Errors Fixed: ${stats.brokenLineCellsFixed} cells (${stats.brokenLineRowsFixed} rows)`,
+        `Internal Pipe ('|' -> '।') Collisions Fixed: ${stats.internalPipesFixed}`,
+        `Index/BOM Markers Stripped: ${stats.specialMarkersStripped}`,
+        `Header Rows Skipped: ${stats.headerRowsSkipped}`,
+        `Empty Rows Skipped: ${stats.emptyRowsSkipped}`,
+        `Incomplete Rows Skipped: ${stats.incompleteRowsSkipped}`,
+        `Exact Duplicates Removed: ${stats.exactDuplicatesRemoved}`,
+        `Duplicate Headwords (Multi-Meaning): ${dupHeadwordSummary}`,
+        `Execution Time: ${stats.executionTimeMs} ms`,
+        incompleteSummary
+    ].join("\n");
+
+    app.dialogs; // Ensure host readiness
+    if (typeof alert === "function") {
+        alert(reportLines);
+    }
+}
+
+// ============================================================================
+// 6. MAIN ENTRY POINT WITH SINGLE-STEP UNDO & REDRAW MANAGEMENT
+// ============================================================================
+
+async function main() {
+    let tables;
+    try {
+        tables = resolveSelectedTables();
+    } catch (err) {
+        if (typeof alert === "function") {
+            alert(`Glossary Converter Error:\n${err.message}`);
+        }
+        return;
+    }
+
+    if (tables.length === 0) {
+        if (typeof alert === "function") {
+            alert(
+                "No Table Found in Selection.\n\nPlease select a table, cells/rows inside a table, or a text frame containing a glossary table."
+            );
+        }
+        return;
+    }
+
+    // 1. Gather user configuration
+    const config = await showPreRunConfigDialog(tables.length);
+    if (!config) return; // User canceled
+
+    // 2. Initialize telemetry counters
+    const stats = {
+        tablesProcessed: tables.length,
+        totalRowsScanned: 0,
+        validEntriesConverted: 0,
+        brokenLineCellsFixed: 0,
+        brokenLineRowsFixed: 0,
+        internalPipesFixed: 0,
+        specialMarkersStripped: 0,
+        headerRowsSkipped: 0,
+        emptyRowsSkipped: 0,
+        incompleteRowsSkipped: 0,
+        incompleteRowDetails: [],
+        exactDuplicatesFound: 0,
+        exactDuplicatesRemoved: 0,
+        multiColumnRowsMerged: 0,
+        duplicateHeadwords: [],
+        executionTimeMs: 0
+    };
+
+    const allConvertedLines = [];
+    const seenEntries = new Set();
+    const headwordMeaningsMap = new Map();
+
+    const previousRedraw = app.scriptPreferences.enableRedraw;
+    const startTime = Date.now();
+
+    try {
+        app.scriptPreferences.enableRedraw = false;
+
+        // Wrap all DOM table removals and text insertions inside a single Undo step
+        app.doScript(
+            () => {
+                // Because `tables` is sorted in reverse story offset order,
+                // we collect output in original story order by unshifting each table's block.
+                const perTableResults = [];
+                for (let i = 0; i < tables.length; i++) {
+                    const lines = processSingleTable(
+                        tables[i],
+                        config,
+                        stats,
+                        seenEntries,
+                        headwordMeaningsMap
+                    );
+                    perTableResults.unshift(lines);
+                }
+
+                for (let i = 0; i < perTableResults.length; i++) {
+                    for (let j = 0; j < perTableResults[i].length; j++) {
+                        allConvertedLines.push(perTableResults[i][j]);
+                    }
+                }
+            },
+            ScriptLanguage.JAVASCRIPT,
+            [],
+            UndoModes.ENTIRE_SCRIPT,
+            "Convert Glossary Table to Word | Meaning"
+        );
+    } finally {
+        app.scriptPreferences.enableRedraw = previousRedraw;
+    }
+
+    stats.executionTimeMs = Date.now() - startTime;
+
+    // Identify headwords that appear with multiple distinct meanings (e.g., "कीर्तन")
+    for (const [headword, meaningsSet] of headwordMeaningsMap.entries()) {
+        if (meaningsSet.size > 1) {
+            stats.duplicateHeadwords.push(`${headword} (${meaningsSet.size}x)`);
+        }
+    }
+
+    // 3. Build copyable preview string and show completion report
+    const previewSeparator = config.doubleSpacedOutput ? "\n\n" : "\n";
+    const previewText = allConvertedLines.join(previewSeparator);
+
+    if (config.showCompletionDialog) {
+        await showCompletionReportDialog(stats, previewText);
+    }
+}
+
+await main();

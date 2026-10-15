@@ -1,0 +1,2451 @@
+// AddGlossaryTopics.idjs
+// Modern UXP JavaScript (.idjs) for Adobe InDesign v18.0+
+// Light Mode, Resizable & Responsive UI with Safe Emojis & Crisp SVGs
+// Made with ❤️ by Rajesh Budhathoki
+
+const indesign = require("indesign");
+const {
+  app,
+  NothingEnum,
+  PageReferenceType,
+  UndoModes,
+  ScriptLanguage,
+} = indesign;
+
+// Cross-version safe UXP Enum resolution
+const NOTHING =
+  NothingEnum && (NothingEnum.nothing ?? NothingEnum.NOTHING);
+const CURRENT_PAGE =
+  PageReferenceType &&
+  (PageReferenceType.CURRENT_PAGE ?? PageReferenceType.currentPage);
+const ENTIRE_SCRIPT =
+  UndoModes && (UndoModes.ENTIRE_SCRIPT ?? UndoModes.entireScript);
+const UXPSCRIPT_LANG =
+  ScriptLanguage &&
+  (ScriptLanguage.UXPSCRIPT ??
+    ScriptLanguage.JAVASCRIPT ??
+    ScriptLanguage.javascript);
+
+// Default sample data (Word | Meaning)
+const DEFAULT_SAMPLE_DATA = [
+  "आदर्श पुरुष | उदाहरणीय वा आदर्श व्यक्ति",
+  "अधर्म | अधर्म वा अन्याय । धर्मको विपरीत भाव वा आचरण ।",
+  "आध्यात्मिक विद्या | आध्यात्मिक ज्ञान",
+].join("\n");
+
+// ============================================================================
+// LIGHT MODE THEME PALETTE & CRISP SVG / EMOJI HELPERS
+// ============================================================================
+
+const THEME = {
+  appBg: "#F1F5F9",
+  cardBg: "#FFFFFF",
+  subtleBg: "#F8FAFC",
+  border: "#E2E8F0",
+  borderStrong: "#CBD5E1",
+  textMain: "#0F172A",
+  textSecondary: "#334155",
+  textMuted: "#64748B",
+  primary: "#2563EB",
+  primaryHover: "#1D4ED8",
+  primarySoft: "#EFF6FF",
+  primaryBorder: "#BFDBFE",
+  successBg: "#DCFCE7",
+  successText: "#15803D",
+  successBorder: "#86EFAC",
+  infoBg: "#DBEAFE",
+  infoText: "#1D4ED8",
+  infoBorder: "#93C5FD",
+  warnBg: "#FEF3C7",
+  warnText: "#B45309",
+  warnBorder: "#FCD34D",
+  dangerBg: "#FEE2E2",
+  dangerHover: "#FECACA",
+  dangerText: "#B91C1C",
+  dangerBorder: "#FCA5A5",
+  neutralBg: "#F1F5F9",
+  neutralText: "#334155",
+  neutralBorder: "#CBD5E1",
+};
+
+/**
+ * Creates a clean icon badge container using only UXP-verified emojis
+ */
+function createIconBadge(emojiChar, bgColor, textColor, sizePx = 32, borderColor = null) {
+  const badge = document.createElement("div");
+  badge.style.display = "flex";
+  badge.style.alignItems = "center";
+  badge.style.justifyContent = "center";
+  badge.style.width = `${sizePx}px`;
+  badge.style.height = `${sizePx}px`;
+  badge.style.borderRadius = "8px";
+  badge.style.backgroundColor = bgColor;
+  badge.style.color = textColor;
+  if (borderColor) {
+    badge.style.border = `1px solid ${borderColor}`;
+  }
+  badge.style.fontSize = `${Math.round(sizePx * 0.55)}px`;
+  badge.style.flexShrink = "0";
+  badge.textContent = emojiChar;
+  return badge;
+}
+
+/**
+ * Creates a crisp inline SVG icon that avoids UXP's black-fill bug by setting fill="none" on path
+ */
+function createSvgIcon(pathData, color = "#2563EB", size = 15) {
+  try {
+    const ns = "http://www.w3.org/2000/svg";
+    const svg = document.createElementNS(ns, "svg");
+    svg.setAttribute("width", String(size));
+    svg.setAttribute("height", String(size));
+    svg.setAttribute("viewBox", "0 0 24 24");
+    svg.setAttribute("fill", "none");
+    svg.style.flexShrink = "0";
+
+    const path = document.createElementNS(ns, "path");
+    path.setAttribute("d", pathData);
+    path.setAttribute("fill", "none");
+    path.setAttribute("stroke", color);
+    path.setAttribute("stroke-width", "2.2");
+    path.setAttribute("stroke-linecap", "round");
+    path.setAttribute("stroke-linejoin", "round");
+
+    svg.appendChild(path);
+    return svg;
+  } catch (e) {
+    const fallback = document.createElement("div");
+    fallback.textContent = "•";
+    fallback.style.color = color;
+    return fallback;
+  }
+}
+
+const SVG_PATHS = {
+  trash: "M3 6h18M8 6V4h8v2M6 6v14h12V6M10 10v6M14 10v6",
+  play: "M6 4l14 8-14 8V4z",
+  copy: "M9 9h11v11H9V9zM5 15H4V4h11v1",
+  close: "M18 6L6 18M6 6l12 12",
+  chevronDown: "M6 9l6 6 6-6",
+  chevronUp: "M18 15l-6-6-6 6",
+  expand: "M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7",
+};
+
+/**
+ * Creates a modern UXP-safe button without native OS bevel artifacts or broken emoji tofu boxes
+ */
+function createModernButton({
+  label,
+  svgPath = null,
+  emoji = null,
+  bgColor = THEME.cardBg,
+  hoverBgColor = THEME.subtleBg,
+  textColor = THEME.textMain,
+  borderColor = THEME.borderStrong,
+  padding = "9px 16px",
+  fontSize = "12.5px",
+  fontWeight = "600",
+  fullWidth = false,
+}) {
+  const btn = document.createElement("div");
+  btn.setAttribute("role", "button");
+  btn.tabIndex = 0;
+  btn.style.display = "flex";
+  btn.style.flexDirection = "row";
+  btn.style.alignItems = "center";
+  btn.style.justifyContent = "center";
+  btn.style.gap = "8px";
+  btn.style.padding = padding;
+  btn.style.borderRadius = "8px";
+  btn.style.backgroundColor = bgColor;
+  btn.style.color = textColor;
+  btn.style.border = borderColor ? `1px solid ${borderColor}` : "1px solid transparent";
+  btn.style.fontSize = fontSize;
+  btn.style.fontWeight = fontWeight;
+  btn.style.cursor = "pointer";
+  btn.style.userSelect = "none";
+  btn.style.flexShrink = "0";
+  if (fullWidth) {
+    btn.style.width = "100%";
+    btn.style.boxSizing = "border-box";
+  }
+
+  let iconNode = null;
+  if (svgPath) {
+    iconNode = createSvgIcon(svgPath, textColor, 14);
+    btn.appendChild(iconNode);
+  } else if (emoji) {
+    iconNode = document.createElement("div");
+    iconNode.textContent = emoji;
+    iconNode.style.fontSize = fontSize;
+    iconNode.style.lineHeight = "1";
+    btn.appendChild(iconNode);
+  }
+
+  const textNode = document.createElement("div");
+  textNode.textContent = label;
+  textNode.style.lineHeight = "1.2";
+  btn.appendChild(textNode);
+
+  let isDisabled = false;
+  let currentBg = bgColor;
+  let currentHoverBg = hoverBgColor;
+
+  btn.addEventListener("mouseenter", () => {
+    if (!isDisabled) btn.style.backgroundColor = currentHoverBg;
+  });
+  btn.addEventListener("mouseleave", () => {
+    if (!isDisabled) btn.style.backgroundColor = currentBg;
+  });
+
+  return {
+    el: btn,
+    textNode,
+    setLabel(newText) {
+      textNode.textContent = newText;
+    },
+    setColors(newBg, newHover, newText, newBorder) {
+      currentBg = newBg;
+      currentHoverBg = newHover || newBg;
+      btn.style.backgroundColor = newBg;
+      btn.style.color = newText;
+      btn.style.border = newBorder ? `1px solid ${newBorder}` : "1px solid transparent";
+    },
+    setDisabled(val) {
+      isDisabled = Boolean(val);
+      btn.style.opacity = isDisabled ? "0.6" : "1";
+      btn.style.pointerEvents = isDisabled ? "none" : "auto";
+    },
+  };
+}
+
+// ============================================================================
+// 1. UXP COLLECTION & DOM HELPERS
+// ============================================================================
+
+function getItem(collectionOrArray, index) {
+  if (!collectionOrArray) return null;
+  try {
+    if (Array.isArray(collectionOrArray)) {
+      return collectionOrArray[index] ?? null;
+    }
+    if (typeof collectionOrArray.item === "function") {
+      const el = collectionOrArray.item(index);
+      return el && el.isValid !== false ? el : null;
+    }
+    return collectionOrArray[index] ?? null;
+  } catch (e) {
+    return null;
+  }
+}
+
+function toArray(collectionOrArray) {
+  if (!collectionOrArray) return [];
+  try {
+    if (Array.isArray(collectionOrArray)) return collectionOrArray;
+    if (
+      typeof collectionOrArray.everyItem === "function" &&
+      collectionOrArray.length > 0
+    ) {
+      const elements = collectionOrArray.everyItem().getElements();
+      if (Array.isArray(elements)) return elements;
+    }
+    const result = [];
+    const len = collectionOrArray.length || 0;
+    for (let i = 0; i < len; i++) {
+      const item = getItem(collectionOrArray, i);
+      if (item) result.push(item);
+    }
+    return result;
+  } catch (e) {
+    return [];
+  }
+}
+
+function getClassName(obj) {
+  if (!obj) return "";
+  try {
+    if (typeof obj.constructorName === "string" && obj.constructorName) {
+      return obj.constructorName;
+    }
+    if (obj.constructor && typeof obj.constructor.name === "string") {
+      return obj.constructor.name;
+    }
+  } catch (e) {}
+  return "";
+}
+
+function runWithUndo(fn, undoLabel) {
+  try {
+    if (typeof app.doScript === "function" && UXPSCRIPT_LANG && ENTIRE_SCRIPT) {
+      app.doScript(fn, UXPSCRIPT_LANG, [], ENTIRE_SCRIPT, undoLabel);
+      return;
+    }
+  } catch (e) {}
+  fn();
+}
+
+function getPage(obj) {
+  let curr = obj;
+  let depth = 0;
+
+  while (curr && depth < 60) {
+    depth++;
+    try {
+      const cName = getClassName(curr);
+      if (cName === "Page") {
+        return curr;
+      }
+
+      if ("parentPage" in curr) {
+        const pp = curr.parentPage;
+        if (pp && pp.isValid !== false) {
+          return pp;
+        }
+      }
+
+      if ("parentTextFrames" in curr) {
+        const frames = curr.parentTextFrames;
+        if (frames && frames.length > 0) {
+          const tf = getItem(frames, 0);
+          if (tf && tf.isValid !== false) {
+            if (
+              "parentPage" in tf &&
+              tf.parentPage &&
+              tf.parentPage.isValid !== false
+            ) {
+              return tf.parentPage;
+            }
+            curr = tf;
+            continue;
+          }
+        }
+      }
+
+      if ("storyOffset" in curr) {
+        const so = curr.storyOffset;
+        if (so && so.isValid !== false) {
+          if (
+            "parentTextFrames" in so &&
+            so.parentTextFrames &&
+            so.parentTextFrames.length > 0
+          ) {
+            const tf = getItem(so.parentTextFrames, 0);
+            if (
+              tf &&
+              tf.isValid !== false &&
+              "parentPage" in tf &&
+              tf.parentPage
+            ) {
+              return tf.parentPage;
+            }
+          }
+          curr = so;
+          continue;
+        }
+      }
+
+      if (
+        cName === "Document" ||
+        cName === "Application" ||
+        cName === "MasterSpread"
+      ) {
+        return null;
+      }
+
+      curr = curr.parent;
+    } catch (e) {
+      break;
+    }
+  }
+  return null;
+}
+
+function getDocumentIndexStats(doc) {
+  let totalTopics = 0;
+  let topicsWithRefs = 0;
+  let totalPageRefs = 0;
+
+  try {
+    if (doc && doc.indexes && doc.indexes.length > 0) {
+      const idx = getItem(doc.indexes, 0);
+      if (idx && idx.topics) {
+        const topicsArr = toArray(idx.topics);
+        totalTopics = topicsArr.length;
+        for (let i = 0; i < topicsArr.length; i++) {
+          try {
+            const refCount = topicsArr[i].pageReferences
+              ? topicsArr[i].pageReferences.length
+              : 0;
+            totalPageRefs += refCount;
+            if (refCount > 0) topicsWithRefs++;
+          } catch (eRef) {}
+        }
+      }
+    }
+  } catch (e) {}
+
+  return {
+    totalTopics,
+    topicsWithRefs,
+    totalPageRefs,
+  };
+}
+
+// ============================================================================
+// 2. UXP MODAL DIALOG HELPERS (SAFE OVERLAY & STANDALONE LIGHT MODE)
+// ============================================================================
+
+async function showAlertDialog(title, message, parentOverlayHost = null) {
+  return new Promise((resolve) => {
+    let settled = false;
+
+    if (parentOverlayHost) {
+      const backdrop = document.createElement("div");
+      backdrop.style.position = "fixed";
+      backdrop.style.top = "0";
+      backdrop.style.left = "0";
+      backdrop.style.right = "0";
+      backdrop.style.bottom = "0";
+      backdrop.style.backgroundColor = "rgba(15, 23, 42, 0.45)";
+      backdrop.style.display = "flex";
+      backdrop.style.alignItems = "center";
+      backdrop.style.justifyContent = "center";
+      backdrop.style.zIndex = "9999";
+      backdrop.style.padding = "24px";
+
+      const card = document.createElement("div");
+      card.style.display = "flex";
+      card.style.flexDirection = "column";
+      card.style.backgroundColor = THEME.cardBg;
+      card.style.color = THEME.textMain;
+      card.style.border = `1px solid ${THEME.borderStrong}`;
+      card.style.borderRadius = "12px";
+      card.style.padding = "22px 24px";
+      card.style.minWidth = "380px";
+      card.style.maxWidth = "540px";
+      card.style.boxShadow = "0 12px 28px rgba(0,0,0,0.18)";
+
+      const headRow = document.createElement("div");
+      headRow.style.display = "flex";
+      headRow.style.alignItems = "center";
+      headRow.style.gap = "12px";
+      headRow.style.marginBottom = "14px";
+
+      headRow.appendChild(
+        createIconBadge("💡", THEME.infoBg, THEME.infoText, 30, THEME.infoBorder)
+      );
+
+      const heading = document.createElement("div");
+      heading.textContent = title || "Notice";
+      heading.style.fontSize = "15px";
+      heading.style.fontWeight = "700";
+      heading.style.color = THEME.textMain;
+      headRow.appendChild(heading);
+      card.appendChild(headRow);
+
+      const body = document.createElement("div");
+      body.textContent = message || "";
+      body.style.fontSize = "12.5px";
+      body.style.lineHeight = "1.6";
+      body.style.whiteSpace = "pre-wrap";
+      body.style.maxHeight = "300px";
+      body.style.overflowY = "auto";
+      body.style.marginBottom = "18px";
+      body.style.padding = "12px 14px";
+      body.style.backgroundColor = THEME.subtleBg;
+      body.style.border = `1px solid ${THEME.border}`;
+      body.style.borderRadius = "8px";
+      body.style.color = THEME.textSecondary;
+      card.appendChild(body);
+
+      const btnRow = document.createElement("div");
+      btnRow.style.display = "flex";
+      btnRow.style.justifyContent = "flex-end";
+
+      const okBtn = createModernButton({
+        label: "OK",
+        emoji: "✅",
+        bgColor: THEME.primary,
+        hoverBgColor: THEME.primaryHover,
+        textColor: "#FFFFFF",
+        borderColor: THEME.primary,
+        padding: "8px 22px",
+      });
+
+      const closeOverlay = () => {
+        if (settled) return;
+        settled = true;
+        try {
+          backdrop.remove();
+        } catch (e) {}
+        resolve();
+      };
+
+      okBtn.el.addEventListener("click", closeOverlay);
+      btnRow.appendChild(okBtn.el);
+      card.appendChild(btnRow);
+      backdrop.appendChild(card);
+      parentOverlayHost.appendChild(backdrop);
+      return;
+    }
+
+    const dlg = document.createElement("dialog");
+    dlg.style.padding = "0";
+    dlg.style.border = `1px solid ${THEME.borderStrong}`;
+    dlg.style.borderRadius = "12px";
+    dlg.style.backgroundColor = THEME.cardBg;
+    dlg.style.color = THEME.textMain;
+    dlg.style.minWidth = "380px";
+    dlg.style.maxWidth = "520px";
+    dlg.style.fontFamily = "system-ui, -apple-system, sans-serif";
+
+    const wrapper = document.createElement("div");
+    wrapper.style.display = "flex";
+    wrapper.style.flexDirection = "column";
+    wrapper.style.padding = "22px 24px";
+
+    const headRow = document.createElement("div");
+    headRow.style.display = "flex";
+    headRow.style.alignItems = "center";
+    headRow.style.gap = "10px";
+    headRow.style.marginBottom = "12px";
+
+    headRow.appendChild(
+      createIconBadge("💡", THEME.infoBg, THEME.infoText, 30, THEME.infoBorder)
+    );
+
+    const heading = document.createElement("div");
+    heading.textContent = title || "Notice";
+    heading.style.fontSize = "15px";
+    heading.style.fontWeight = "700";
+    heading.style.color = THEME.textMain;
+    headRow.appendChild(heading);
+    wrapper.appendChild(headRow);
+
+    const body = document.createElement("div");
+    body.textContent = message || "";
+    body.style.fontSize = "12.5px";
+    body.style.lineHeight = "1.6";
+    body.style.whiteSpace = "pre-wrap";
+    body.style.maxHeight = "320px";
+    body.style.overflowY = "auto";
+    body.style.marginBottom = "18px";
+    body.style.color = THEME.textSecondary;
+    wrapper.appendChild(body);
+
+    const btnRow = document.createElement("div");
+    btnRow.style.display = "flex";
+    btnRow.style.justifyContent = "flex-end";
+
+    const okBtn = createModernButton({
+      label: "OK",
+      emoji: "✅",
+      bgColor: THEME.primary,
+      hoverBgColor: THEME.primaryHover,
+      textColor: "#FFFFFF",
+      borderColor: THEME.primary,
+      padding: "8px 22px",
+    });
+
+    const closeDialog = () => {
+      if (settled) return;
+      settled = true;
+      try {
+        dlg.close();
+      } catch (e) {}
+      try {
+        dlg.remove();
+      } catch (e) {}
+      resolve();
+    };
+
+    okBtn.el.addEventListener("click", closeDialog);
+    dlg.addEventListener("cancel", closeDialog);
+
+    btnRow.appendChild(okBtn.el);
+    wrapper.appendChild(btnRow);
+    dlg.appendChild(wrapper);
+    document.body.appendChild(dlg);
+    dlg.showModal();
+  });
+}
+
+async function showConfirmDialog(title, message, parentOverlayHost = null) {
+  return new Promise((resolve) => {
+    let settled = false;
+
+    if (parentOverlayHost) {
+      const backdrop = document.createElement("div");
+      backdrop.style.position = "fixed";
+      backdrop.style.top = "0";
+      backdrop.style.left = "0";
+      backdrop.style.right = "0";
+      backdrop.style.bottom = "0";
+      backdrop.style.backgroundColor = "rgba(15, 23, 42, 0.45)";
+      backdrop.style.display = "flex";
+      backdrop.style.alignItems = "center";
+      backdrop.style.justifyContent = "center";
+      backdrop.style.zIndex = "9999";
+      backdrop.style.padding = "24px";
+
+      const card = document.createElement("div");
+      card.style.display = "flex";
+      card.style.flexDirection = "column";
+      card.style.backgroundColor = THEME.cardBg;
+      card.style.color = THEME.textMain;
+      card.style.border = `1px solid ${THEME.dangerBorder}`;
+      card.style.borderRadius = "12px";
+      card.style.padding = "22px 24px";
+      card.style.minWidth = "400px";
+      card.style.maxWidth = "520px";
+      card.style.boxShadow = "0 12px 28px rgba(0,0,0,0.18)";
+
+      const headRow = document.createElement("div");
+      headRow.style.display = "flex";
+      headRow.style.alignItems = "center";
+      headRow.style.gap = "12px";
+      headRow.style.marginBottom = "14px";
+
+      headRow.appendChild(
+        createIconBadge("⚠️", THEME.dangerBg, THEME.dangerText, 30, THEME.dangerBorder)
+      );
+
+      const heading = document.createElement("div");
+      heading.textContent = title || "Confirm Action";
+      heading.style.fontSize = "15px";
+      heading.style.fontWeight = "700";
+      heading.style.color = THEME.dangerText;
+      headRow.appendChild(heading);
+      card.appendChild(headRow);
+
+      const body = document.createElement("div");
+      body.textContent = message || "";
+      body.style.fontSize = "12.5px";
+      body.style.lineHeight = "1.6";
+      body.style.whiteSpace = "pre-wrap";
+      body.style.marginBottom = "20px";
+      body.style.padding = "12px 14px";
+      body.style.backgroundColor = "#FFF5F5";
+      body.style.border = `1px solid ${THEME.dangerBorder}`;
+      body.style.borderRadius = "8px";
+      body.style.color = THEME.textMain;
+      card.appendChild(body);
+
+      const btnRow = document.createElement("div");
+      btnRow.style.display = "flex";
+      btnRow.style.justifyContent = "flex-end";
+      btnRow.style.gap = "12px";
+
+      const cancelBtn = createModernButton({
+        label: "Cancel",
+        svgPath: SVG_PATHS.close,
+        bgColor: THEME.cardBg,
+        hoverBgColor: THEME.subtleBg,
+        textColor: THEME.textSecondary,
+        borderColor: THEME.borderStrong,
+        padding: "8px 18px",
+      });
+
+      const confirmBtn = createModernButton({
+        label: "Yes, Delete All",
+        svgPath: SVG_PATHS.trash,
+        bgColor: THEME.dangerText,
+        hoverBgColor: "#991B1B",
+        textColor: "#FFFFFF",
+        borderColor: THEME.dangerText,
+        padding: "8px 18px",
+      });
+
+      const finish = (val) => {
+        if (settled) return;
+        settled = true;
+        try {
+          backdrop.remove();
+        } catch (e) {}
+        resolve(val);
+      };
+
+      cancelBtn.el.addEventListener("click", () => finish(false));
+      confirmBtn.el.addEventListener("click", () => finish(true));
+
+      btnRow.appendChild(cancelBtn.el);
+      btnRow.appendChild(confirmBtn.el);
+      card.appendChild(btnRow);
+      backdrop.appendChild(card);
+      parentOverlayHost.appendChild(backdrop);
+      return;
+    }
+
+    resolve(false);
+  });
+}
+
+// ============================================================================
+// 3. DELETE ALL INDEX REFERENCES, TOPICS & MARKERS (~I) WITH STATS
+// ============================================================================
+
+function clearAllIndexData() {
+  const startTime = Date.now();
+  const doc = app.activeDocument;
+  let removedTopics = 0;
+  let removedPageRefs = 0;
+  let removedMarkers = 0;
+
+  let oldRedraw = true;
+  try {
+    oldRedraw = app.scriptPreferences.enableRedraw;
+    app.scriptPreferences.enableRedraw = false;
+  } catch (e) {}
+
+  runWithUndo(() => {
+    try {
+      const indexesLen = doc.indexes.length;
+      for (let i = 0; i < indexesLen; i++) {
+        const idx = getItem(doc.indexes, i);
+        if (!idx) continue;
+
+        const allTopics = toArray(idx.topics);
+        removedTopics += allTopics.length;
+
+        for (let t = allTopics.length - 1; t >= 0; t--) {
+          const topic = allTopics[t];
+          try {
+            if (topic.pageReferences && topic.pageReferences.length > 0) {
+              removedPageRefs += topic.pageReferences.length;
+              topic.pageReferences.everyItem().remove();
+            }
+          } catch (eRef) {}
+        }
+
+        try {
+          if (idx.topics && idx.topics.length > 0) {
+            idx.topics.everyItem().remove();
+          }
+        } catch (eTop) {}
+
+        try {
+          if (typeof idx.removeUnusedTopics === "function") {
+            idx.removeUnusedTopics();
+          }
+        } catch (eUnused) {}
+      }
+    } catch (eIdx) {}
+
+    try {
+      app.findGrepPreferences = NOTHING;
+      app.changeGrepPreferences = NOTHING;
+
+      if (app.findChangeGrepOptions) {
+        app.findChangeGrepOptions.includeFootnotes = true;
+        app.findChangeGrepOptions.includeHiddenLayers = true;
+        app.findChangeGrepOptions.includeLockedLayersForFind = true;
+        app.findChangeGrepOptions.includeLockedStoriesForFind = true;
+        app.findChangeGrepOptions.includeMasterPages = true;
+      }
+
+      app.findGrepPreferences.findWhat = "~I";
+      app.changeGrepPreferences.changeTo = "";
+      const changed = doc.changeGrep();
+      if (changed && typeof changed.length === "number") {
+        removedMarkers = changed.length;
+      }
+    } catch (eGrep) {
+    } finally {
+      app.findGrepPreferences = NOTHING;
+      app.changeGrepPreferences = NOTHING;
+    }
+
+    try {
+      if (doc.indexes.length > 0) {
+        const idx = getItem(doc.indexes, 0);
+        if (idx && typeof idx.update === "function") {
+          idx.update();
+        }
+      }
+    } catch (eUpd) {}
+  }, "Delete All Index Data");
+
+  try {
+    app.scriptPreferences.enableRedraw = oldRedraw;
+  } catch (e) {}
+
+  return {
+    removedTopics,
+    removedPageRefs,
+    removedMarkers,
+    durationMs: Date.now() - startTime,
+  };
+}
+
+// ============================================================================
+// 4. DEVANAGARI-SAFE SEARCH & REFERENCE INSERTION ENGINE
+// ============================================================================
+
+function normalizeText(str) {
+  if (!str) return "";
+  let cleaned = String(str)
+    .replace(/[\uFEFF\u200B]/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (typeof cleaned.normalize === "function") {
+    cleaned = cleaned.normalize("NFC");
+  }
+  return cleaned;
+}
+
+function parseGlossaryInput(rawText) {
+  const rawLines = String(rawText || "").split(/\r?\n/);
+  const validItems = [];
+  let invalidLines = 0;
+  let totalNonEmptyLines = 0;
+
+  for (let k = 0; k < rawLines.length; k++) {
+    const line = normalizeText(rawLines[k]);
+    if (line === "") continue;
+    totalNonEmptyLines++;
+
+    if (line.includes("|")) {
+      const pipeIndex = line.indexOf("|");
+      const cleanWord = normalizeText(line.slice(0, pipeIndex));
+      const cleanMeaning = normalizeText(line.slice(pipeIndex + 1));
+
+      if (cleanWord !== "" && cleanMeaning !== "") {
+        validItems.push({
+          fullTopic: `${cleanWord} | ${cleanMeaning}`,
+          searchWord: cleanWord,
+          meaning: cleanMeaning,
+        });
+      } else {
+        invalidLines++;
+      }
+    } else {
+      invalidLines++;
+    }
+  }
+
+  return {
+    validItems,
+    invalidLines,
+    totalNonEmptyLines,
+  };
+}
+
+function escapeGrep(str) {
+  return str.replace(/([\\^$.|?*+()[\]{}~])/g, "\\$1");
+}
+
+function configureFindOptions(isCaseSensitive, isWholeWord) {
+  if (app.findChangeTextOptions) {
+    app.findChangeTextOptions.caseSensitive = Boolean(isCaseSensitive);
+    app.findChangeTextOptions.wholeWord = Boolean(isWholeWord);
+    app.findChangeTextOptions.includeFootnotes = true;
+    app.findChangeTextOptions.includeHiddenLayers = true;
+    app.findChangeTextOptions.includeLockedLayersForFind = true;
+    app.findChangeTextOptions.includeLockedStoriesForFind = true;
+    app.findChangeTextOptions.includeMasterPages = false;
+  }
+  if (app.findChangeGrepOptions) {
+    app.findChangeGrepOptions.includeFootnotes = true;
+    app.findChangeGrepOptions.includeHiddenLayers = true;
+    app.findChangeGrepOptions.includeLockedLayersForFind = true;
+    app.findChangeGrepOptions.includeLockedStoriesForFind = true;
+    app.findChangeGrepOptions.includeMasterPages = false;
+  }
+}
+
+function findMatchesForTerm(
+  doc,
+  wordToSearch,
+  targetStyle,
+  isCaseSensitive,
+  isWholeWord
+) {
+  app.findTextPreferences = NOTHING;
+  app.changeTextPreferences = NOTHING;
+  configureFindOptions(isCaseSensitive, isWholeWord);
+
+  if (targetStyle !== null) {
+    app.findTextPreferences.appliedParagraphStyle = targetStyle;
+  }
+  app.findTextPreferences.findWhat = wordToSearch;
+
+  let found = toArray(doc.findText());
+  if (found.length > 0) {
+    return found;
+  }
+
+  if (isWholeWord) {
+    app.findChangeTextOptions.wholeWord = false;
+    found = toArray(doc.findText());
+    if (found.length > 0) {
+      return found;
+    }
+  }
+
+  try {
+    app.findGrepPreferences = NOTHING;
+    app.changeGrepPreferences = NOTHING;
+    if (targetStyle !== null) {
+      app.findGrepPreferences.appliedParagraphStyle = targetStyle;
+    }
+    const tokens = wordToSearch.split(/\s+/).map(escapeGrep);
+    const grepPattern = tokens.join("[\\s~S~-~I]+");
+    app.findGrepPreferences.findWhat = grepPattern;
+    found = toArray(doc.findGrep());
+  } catch (eGrep) {
+  } finally {
+    app.findGrepPreferences = NOTHING;
+    app.changeGrepPreferences = NOTHING;
+  }
+
+  return found;
+}
+
+function addPageReferenceSafe(myTopic, foundText) {
+  const candidates = [];
+
+  try {
+    if (foundText.insertionPoints && foundText.insertionPoints.length > 0) {
+      const ip0 = getItem(foundText.insertionPoints, 0);
+      if (ip0) candidates.push(ip0);
+    }
+  } catch (e) {}
+
+  candidates.push(foundText);
+
+  try {
+    if (foundText.texts && foundText.texts.length > 0) {
+      const t0 = getItem(foundText.texts, 0);
+      if (t0) candidates.push(t0);
+    }
+  } catch (e) {}
+
+  try {
+    if (foundText.characters && foundText.characters.length > 0) {
+      const c0 = getItem(foundText.characters, 0);
+      if (c0) candidates.push(c0);
+    }
+  } catch (e) {}
+
+  for (let c = 0; c < candidates.length; c++) {
+    const target = candidates[c];
+    if (!target) continue;
+
+    try {
+      if (CURRENT_PAGE !== undefined) {
+        const ref = myTopic.pageReferences.add(target, CURRENT_PAGE);
+        if (ref && ref.isValid !== false) return true;
+      }
+    } catch (e1) {}
+
+    try {
+      const ref = myTopic.pageReferences.add(target);
+      if (ref && ref.isValid !== false) return true;
+    } catch (e2) {}
+  }
+
+  return false;
+}
+
+function runCoreIndexer(
+  indexData,
+  targetStyle,
+  startPageName,
+  endPageName,
+  isCaseSensitive,
+  isWholeWord
+) {
+  const startTime = Date.now();
+  const doc = app.activeDocument;
+  const myIndex =
+    doc.indexes.length === 0 ? doc.indexes.add() : getItem(doc.indexes, 0);
+
+  const pagesArr = toArray(doc.pages);
+  let startOffset = 0;
+  let endOffset = Math.max(0, pagesArr.length - 1);
+  let startMatched = false;
+
+  for (let p = 0; p < pagesArr.length; p++) {
+    const pg = pagesArr[p];
+    const pgName = String(pg.name).trim();
+    const pgOffset =
+      typeof pg.documentOffset === "number" ? pg.documentOffset : p;
+
+    if (!startMatched && pgName === startPageName) {
+      startOffset = pgOffset;
+      startMatched = true;
+    }
+    if (pgName === endPageName) {
+      endOffset = pgOffset;
+    }
+  }
+
+  if (startOffset > endOffset) {
+    const temp = startOffset;
+    startOffset = endOffset;
+    endOffset = temp;
+  }
+
+  let newTopicsAdded = 0;
+  let existingTopicsUpdated = 0;
+  let newRefsAdded = 0;
+  let totalRawMatches = 0;
+  let duplicatesSkipped = 0;
+  let outOfRangeSkipped = 0;
+  const unmatchedTerms = [];
+  const termDetails = [];
+
+  for (let i = 0; i < indexData.length; i++) {
+    const currentTopicString = indexData[i].fullTopic;
+    const wordToSearch = indexData[i].searchWord;
+    const meaningText = indexData[i].meaning;
+
+    const foundItems = findMatchesForTerm(
+      doc,
+      wordToSearch,
+      targetStyle,
+      isCaseSensitive,
+      isWholeWord
+    );
+    totalRawMatches += foundItems.length;
+
+    const processedPageIds = new Set();
+    const processedPageNames = new Set();
+    const existingPagesList = [];
+
+    let myTopic = null;
+    try {
+      const candidateTopic = myIndex.topics.itemByName(currentTopicString);
+      if (candidateTopic && candidateTopic.isValid) {
+        myTopic = candidateTopic;
+        const existingRefs = toArray(myTopic.pageReferences);
+        for (let r = 0; r < existingRefs.length; r++) {
+          try {
+            const srcText = existingRefs[r].sourceText;
+            const existingPage = getPage(srcText);
+            if (existingPage) {
+              const pId = String(existingPage.id);
+              const pName = String(existingPage.name);
+              processedPageIds.add(pId);
+              processedPageNames.add(pName);
+              if (!existingPagesList.includes(pName)) {
+                existingPagesList.push(pName);
+              }
+            }
+          } catch (eExisting) {}
+        }
+      }
+    } catch (eLookup) {}
+
+    const uniquePageMatches = [];
+    let termDuplicatesSkipped = 0;
+    let termOutOfRange = 0;
+
+    for (let j = 0; j < foundItems.length; j++) {
+      const foundText = foundItems[j];
+      const textPage = getPage(foundText);
+
+      if (textPage !== null) {
+        const currentOffset =
+          typeof textPage.documentOffset === "number"
+            ? textPage.documentOffset
+            : 0;
+        const pageId = String(textPage.id);
+        const pageName = String(textPage.name);
+
+        if (currentOffset >= startOffset && currentOffset <= endOffset) {
+          if (
+            !processedPageIds.has(pageId) &&
+            !processedPageNames.has(pageName)
+          ) {
+            processedPageIds.add(pageId);
+            processedPageNames.add(pageName);
+            uniquePageMatches.push({
+              foundText,
+              pageId,
+              pageName,
+            });
+          } else {
+            termDuplicatesSkipped++;
+            duplicatesSkipped++;
+          }
+        } else {
+          termOutOfRange++;
+          outOfRangeSkipped++;
+        }
+      }
+    }
+
+    if (uniquePageMatches.length === 0) {
+      if (!myTopic) {
+        unmatchedTerms.push(wordToSearch);
+        termDetails.push({
+          word: wordToSearch,
+          meaning: meaningText,
+          fullTopic: currentTopicString,
+          status: "NOT_FOUND",
+          rawMatches: foundItems.length,
+          addedRefs: 0,
+          duplicatesSkipped: termDuplicatesSkipped,
+          outOfRange: termOutOfRange,
+          pages: [],
+        });
+      } else {
+        termDetails.push({
+          word: wordToSearch,
+          meaning: meaningText,
+          fullTopic: currentTopicString,
+          status: "EXISTS",
+          rawMatches: foundItems.length,
+          addedRefs: 0,
+          duplicatesSkipped: termDuplicatesSkipped,
+          outOfRange: termOutOfRange,
+          pages: existingPagesList,
+        });
+      }
+      continue;
+    }
+
+    let topicCreatedNow = false;
+    if (!myTopic) {
+      myTopic = myIndex.topics.add(currentTopicString);
+      newTopicsAdded++;
+      topicCreatedNow = true;
+    } else {
+      existingTopicsUpdated++;
+    }
+
+    let addedForThisTopic = 0;
+    const newlyCapturedPages = [];
+    for (let k = uniquePageMatches.length - 1; k >= 0; k--) {
+      const matchObj = uniquePageMatches[k];
+      if (addPageReferenceSafe(myTopic, matchObj.foundText)) {
+        newRefsAdded++;
+        addedForThisTopic++;
+        newlyCapturedPages.unshift(matchObj.pageName);
+      }
+    }
+
+    if (
+      topicCreatedNow &&
+      addedForThisTopic === 0 &&
+      myTopic.pageReferences.length === 0
+    ) {
+      try {
+        myTopic.remove();
+        newTopicsAdded--;
+        unmatchedTerms.push(wordToSearch);
+        termDetails.push({
+          word: wordToSearch,
+          meaning: meaningText,
+          fullTopic: currentTopicString,
+          status: "NOT_FOUND",
+          rawMatches: foundItems.length,
+          addedRefs: 0,
+          duplicatesSkipped: termDuplicatesSkipped,
+          outOfRange: termOutOfRange,
+          pages: [],
+        });
+      } catch (eRem) {}
+    } else {
+      const allPagesForTerm = existingPagesList.concat(newlyCapturedPages);
+      termDetails.push({
+        word: wordToSearch,
+        meaning: meaningText,
+        fullTopic: currentTopicString,
+        status: topicCreatedNow ? "NEW" : "UPDATED",
+        rawMatches: foundItems.length,
+        addedRefs: addedForThisTopic,
+        duplicatesSkipped: termDuplicatesSkipped,
+        outOfRange: termOutOfRange,
+        pages: allPagesForTerm,
+      });
+    }
+  }
+
+  app.findTextPreferences = NOTHING;
+  app.changeTextPreferences = NOTHING;
+  app.findGrepPreferences = NOTHING;
+  app.changeGrepPreferences = NOTHING;
+
+  try {
+    myIndex.update();
+  } catch (eUpd) {}
+
+  return {
+    totalTerms: indexData.length,
+    newTopicsAdded,
+    existingTopicsUpdated,
+    newRefsAdded,
+    totalRawMatches,
+    duplicatesSkipped,
+    outOfRangeSkipped,
+    unmatchedTerms,
+    termDetails,
+    durationMs: Date.now() - startTime,
+  };
+}
+
+// ============================================================================
+// 5. MAIN UXP DIALOG UI (RESIZABLE, RESPONSIVE, PROPER SPACING & SAFE EMOJIS)
+// ============================================================================
+
+function createStatPill(iconEmoji, label, initialValue, accentColor, softBg, borderColor) {
+  const pill = document.createElement("div");
+  pill.style.display = "flex";
+  pill.style.flexDirection = "row";
+  pill.style.alignItems = "center";
+  pill.style.gap = "12px";
+  pill.style.flex = "1 1 150px";
+  pill.style.minWidth = "148px";
+  pill.style.padding = "12px 14px";
+  pill.style.backgroundColor = THEME.cardBg;
+  pill.style.border = `1px solid ${THEME.border}`;
+  pill.style.borderRadius = "10px";
+  pill.style.boxSizing = "border-box";
+  pill.style.flexShrink = "0";
+
+  const iconEl = createIconBadge(iconEmoji, softBg, accentColor, 36, borderColor);
+
+  const textCol = document.createElement("div");
+  textCol.style.display = "flex";
+  textCol.style.flexDirection = "column";
+  textCol.style.gap = "2px";
+
+  const valEl = document.createElement("div");
+  valEl.textContent = String(initialValue);
+  valEl.style.fontSize = "17px";
+  valEl.style.fontWeight = "700";
+  valEl.style.color = accentColor || THEME.textMain;
+  valEl.style.lineHeight = "1.2";
+
+  const lblEl = document.createElement("div");
+  lblEl.textContent = label;
+  lblEl.style.fontSize = "11.5px";
+  lblEl.style.fontWeight = "600";
+  lblEl.style.color = THEME.textMuted;
+
+  textCol.appendChild(valEl);
+  textCol.appendChild(lblEl);
+
+  pill.appendChild(iconEl);
+  pill.appendChild(textCol);
+
+  return { pill, valEl, lblEl };
+}
+
+async function main() {
+  if (app.documents.length === 0) {
+    await showAlertDialog(
+      "No Document Open",
+      "Please open an InDesign document before running the Glossary Indexer."
+    );
+    return;
+  }
+
+  const doc = app.activeDocument;
+  const allStyles = toArray(doc.allParagraphStyles);
+  const pagesArr = toArray(doc.pages);
+
+  const firstPageName =
+    pagesArr.length > 0 ? String(pagesArr[0].name) : "1";
+  const lastPageName =
+    pagesArr.length > 0 ? String(pagesArr[pagesArr.length - 1].name) : "1";
+
+  // Build Resizable & Responsive Light-Mode UXP Modal Dialog
+  const dialog = document.createElement("dialog");
+  dialog.style.padding = "0";
+  dialog.style.border = `1px solid ${THEME.borderStrong}`;
+  dialog.style.borderRadius = "12px";
+  dialog.style.backgroundColor = THEME.appBg;
+  dialog.style.color = THEME.textMain;
+  dialog.style.width = "760px";
+  dialog.style.height = "680px";
+  dialog.style.minWidth = "560px";
+  dialog.style.minHeight = "480px";
+  dialog.style.maxWidth = "96vw";
+  dialog.style.maxHeight = "94vh";
+  dialog.style.fontFamily = "system-ui, -apple-system, sans-serif";
+  dialog.style.position = "relative";
+  dialog.style.overflow = "hidden";
+
+  // Outer Shell: Sticky Header + Scrollable Body + Sticky Footer
+  const appShell = document.createElement("div");
+  appShell.style.display = "flex";
+  appShell.style.flexDirection = "column";
+  appShell.style.width = "100%";
+  appShell.style.height = "100%";
+  appShell.style.boxSizing = "border-box";
+  appShell.style.overflow = "hidden";
+
+  // --- 1. Sticky Top Header ---
+  const headerBar = document.createElement("div");
+  headerBar.style.display = "flex";
+  headerBar.style.flexWrap = "wrap";
+  headerBar.style.justifyContent = "space-between";
+  headerBar.style.alignItems = "center";
+  headerBar.style.gap = "12px";
+  headerBar.style.padding = "16px 24px";
+  headerBar.style.backgroundColor = THEME.cardBg;
+  headerBar.style.borderBottom = `1px solid ${THEME.border}`;
+  headerBar.style.flexShrink = "0";
+
+  const titleLeft = document.createElement("div");
+  titleLeft.style.display = "flex";
+  titleLeft.style.alignItems = "center";
+  titleLeft.style.gap = "12px";
+
+  const appIcon = createIconBadge(
+    "📑",
+    THEME.primarySoft,
+    THEME.primary,
+    38,
+    THEME.primaryBorder
+  );
+
+  const titleTextWrap = document.createElement("div");
+  titleTextWrap.style.display = "flex";
+  titleTextWrap.style.flexDirection = "column";
+  titleTextWrap.style.gap = "2px";
+
+  const titleEl = document.createElement("div");
+  titleEl.textContent = "Glossary Indexer & Page Reference Builder";
+  titleEl.style.fontSize = "16px";
+  titleEl.style.fontWeight = "700";
+  titleEl.style.color = THEME.textMain;
+
+  const subtitleEl = document.createElement("div");
+  subtitleEl.textContent =
+    "Automated Devanagari & Unicode Index Topic Marker (~I)";
+  subtitleEl.style.fontSize = "11.5px";
+  subtitleEl.style.color = THEME.textMuted;
+
+  titleTextWrap.appendChild(titleEl);
+  titleTextWrap.appendChild(subtitleEl);
+  titleLeft.appendChild(appIcon);
+  titleLeft.appendChild(titleTextWrap);
+
+  const headerRight = document.createElement("div");
+  headerRight.style.display = "flex";
+  headerRight.style.alignItems = "center";
+  headerRight.style.gap = "8px";
+  headerRight.style.flexWrap = "wrap";
+
+  const docBadge = document.createElement("div");
+  docBadge.textContent = `📄 ${doc.name || "Active Document"}`;
+  docBadge.style.fontSize = "11.5px";
+  docBadge.style.fontWeight = "600";
+  docBadge.style.padding = "6px 12px";
+  docBadge.style.borderRadius = "8px";
+  docBadge.style.backgroundColor = THEME.primarySoft;
+  docBadge.style.border = `1px solid ${THEME.primaryBorder}`;
+  docBadge.style.color = THEME.primary;
+  docBadge.style.maxWidth = "240px";
+  docBadge.style.overflow = "hidden";
+  docBadge.style.textOverflow = "ellipsis";
+  docBadge.style.whiteSpace = "nowrap";
+
+  // Quick Window Size / Responsive Toggle Button (Cycles Compact / Standard / Large)
+  const WINDOW_PRESETS = [
+    { name: "Standard", w: 760, h: 680, textareaH: 135 },
+    { name: "Large", w: 920, h: 780, textareaH: 190 },
+    { name: "Compact", w: 640, h: 580, textareaH: 105 },
+  ];
+  let currentPresetIdx = 0;
+
+  const btnWindowSize = createModernButton({
+    label: "Size: Standard",
+    svgPath: SVG_PATHS.expand,
+    bgColor: THEME.subtleBg,
+    hoverBgColor: THEME.border,
+    textColor: THEME.textSecondary,
+    borderColor: THEME.borderStrong,
+    padding: "6px 10px",
+    fontSize: "11px",
+  });
+
+  headerRight.appendChild(docBadge);
+  headerRight.appendChild(btnWindowSize.el);
+
+  headerBar.appendChild(titleLeft);
+  headerBar.appendChild(headerRight);
+  appShell.appendChild(headerBar);
+
+  // --- 2. Scrollable Middle Content Area (Responsive & Properly Spaced) ---
+  const scrollBody = document.createElement("div");
+  scrollBody.style.display = "flex";
+  scrollBody.style.flexDirection = "column";
+  scrollBody.style.flex = "1";
+  scrollBody.style.padding = "18px 24px";
+  scrollBody.style.gap = "16px";
+  scrollBody.style.overflowY = "auto";
+  scrollBody.style.boxSizing = "border-box";
+
+  // 2A. Live Document & Input Stats Bar
+  const liveStatsBar = document.createElement("div");
+  liveStatsBar.style.display = "flex";
+  liveStatsBar.style.flexWrap = "wrap";
+  liveStatsBar.style.gap = "12px";
+  liveStatsBar.style.flexShrink = "0";
+
+  const initialDocStats = getDocumentIndexStats(doc);
+  const initialInputStats = parseGlossaryInput(DEFAULT_SAMPLE_DATA);
+
+  const statDocPages = createStatPill(
+    "📄",
+    "Document Pages",
+    pagesArr.length,
+    "#2563EB",
+    "#EFF6FF",
+    "#BFDBFE"
+  );
+  const statDocTopics = createStatPill(
+    "🏷️",
+    "Active Index Topics",
+    initialDocStats.totalTopics,
+    "#15803D",
+    "#DCFCE7",
+    "#86EFAC"
+  );
+  const statDocRefs = createStatPill(
+    "🔖",
+    "Active Page Refs (~I)",
+    initialDocStats.totalPageRefs,
+    "#B45309",
+    "#FEF3C7",
+    "#FCD34D"
+  );
+  const statInputValid = createStatPill(
+    "✅",
+    "Valid Glossary Lines",
+    initialInputStats.validItems.length,
+    "#7C3AED",
+    "#F3E8FF",
+    "#DDD6FE"
+  );
+
+  liveStatsBar.appendChild(statDocPages.pill);
+  liveStatsBar.appendChild(statDocTopics.pill);
+  liveStatsBar.appendChild(statDocRefs.pill);
+  liveStatsBar.appendChild(statInputValid.pill);
+  scrollBody.appendChild(liveStatsBar);
+
+  // 2B. Search Filters Panel
+  const filterPanel = document.createElement("div");
+  filterPanel.style.display = "flex";
+  filterPanel.style.flexDirection = "column";
+  filterPanel.style.gap = "14px";
+  filterPanel.style.padding = "16px 18px";
+  filterPanel.style.backgroundColor = THEME.cardBg;
+  filterPanel.style.border = `1px solid ${THEME.border}`;
+  filterPanel.style.borderRadius = "10px";
+  filterPanel.style.flexShrink = "0";
+
+  const filterHeader = document.createElement("div");
+  filterHeader.style.display = "flex";
+  filterHeader.style.alignItems = "center";
+  filterHeader.style.gap = "8px";
+  filterHeader.style.paddingBottom = "8px";
+  filterHeader.style.borderBottom = `1px solid ${THEME.subtleBg}`;
+
+  const filterTitle = document.createElement("div");
+  filterTitle.textContent =
+    "🔍 Search Filters & Scope (Leave default to scan entire document)";
+  filterTitle.style.fontSize = "13px";
+  filterTitle.style.fontWeight = "700";
+  filterTitle.style.color = THEME.textMain;
+  filterHeader.appendChild(filterTitle);
+  filterPanel.appendChild(filterHeader);
+
+  // Target Paragraph Style Row
+  const styleRow = document.createElement("div");
+  styleRow.style.display = "flex";
+  styleRow.style.flexWrap = "wrap";
+  styleRow.style.alignItems = "center";
+  styleRow.style.justifyContent = "space-between";
+  styleRow.style.gap = "12px";
+
+  const styleLabel = document.createElement("div");
+  styleLabel.textContent = "¶ Target Paragraph Style:";
+  styleLabel.style.fontSize = "12.5px";
+  styleLabel.style.fontWeight = "600";
+  styleLabel.style.color = THEME.textSecondary;
+  styleLabel.style.minWidth = "155px";
+
+  const styleSelect = document.createElement("select");
+  styleSelect.style.flex = "1 1 260px";
+  styleSelect.style.height = "34px";
+  styleSelect.style.padding = "4px 10px";
+  styleSelect.style.borderRadius = "8px";
+  styleSelect.style.border = `1px solid ${THEME.borderStrong}`;
+  styleSelect.style.backgroundColor = THEME.subtleBg;
+  styleSelect.style.color = THEME.textMain;
+  styleSelect.style.fontSize = "12.5px";
+
+  const anyOption = document.createElement("option");
+  anyOption.value = "0";
+  anyOption.textContent = "[Any Paragraph Style]";
+  styleSelect.appendChild(anyOption);
+
+  for (let s = 0; s < allStyles.length; s++) {
+    const opt = document.createElement("option");
+    opt.value = String(s + 1);
+    opt.textContent = allStyles[s].name;
+    styleSelect.appendChild(opt);
+  }
+  styleSelect.selectedIndex = 0;
+
+  styleRow.appendChild(styleLabel);
+  styleRow.appendChild(styleSelect);
+  filterPanel.appendChild(styleRow);
+
+  // Page Range & Checkboxes Row
+  const pageAndOptionsRow = document.createElement("div");
+  pageAndOptionsRow.style.display = "flex";
+  pageAndOptionsRow.style.flexWrap = "wrap";
+  pageAndOptionsRow.style.alignItems = "center";
+  pageAndOptionsRow.style.justifyContent = "space-between";
+  pageAndOptionsRow.style.gap = "14px";
+  pageAndOptionsRow.style.paddingTop = "4px";
+
+  const pageGroup = document.createElement("div");
+  pageGroup.style.display = "flex";
+  pageGroup.style.flexWrap = "wrap";
+  pageGroup.style.alignItems = "center";
+  pageGroup.style.gap = "10px";
+
+  const startLabel = document.createElement("div");
+  startLabel.textContent = "📖 Start Page:";
+  startLabel.style.fontSize = "12.5px";
+  startLabel.style.fontWeight = "600";
+  startLabel.style.color = THEME.textSecondary;
+
+  const startPageInput = document.createElement("input");
+  startPageInput.type = "text";
+  startPageInput.value = firstPageName;
+  startPageInput.style.width = "72px";
+  startPageInput.style.height = "32px";
+  startPageInput.style.padding = "4px 10px";
+  startPageInput.style.borderRadius = "8px";
+  startPageInput.style.border = `1px solid ${THEME.borderStrong}`;
+  startPageInput.style.backgroundColor = THEME.subtleBg;
+  startPageInput.style.color = THEME.textMain;
+  startPageInput.style.fontSize = "12.5px";
+  startPageInput.style.fontWeight = "600";
+  startPageInput.style.boxSizing = "border-box";
+
+  const endLabel = document.createElement("div");
+  endLabel.textContent = "End Page:";
+  endLabel.style.fontSize = "12.5px";
+  endLabel.style.fontWeight = "600";
+  endLabel.style.color = THEME.textSecondary;
+  endLabel.style.marginLeft = "6px";
+
+  const endPageInput = document.createElement("input");
+  endPageInput.type = "text";
+  endPageInput.value = lastPageName;
+  endPageInput.style.width = "72px";
+  endPageInput.style.height = "32px";
+  endPageInput.style.padding = "4px 10px";
+  endPageInput.style.borderRadius = "8px";
+  endPageInput.style.border = `1px solid ${THEME.borderStrong}`;
+  endPageInput.style.backgroundColor = THEME.subtleBg;
+  endPageInput.style.color = THEME.textMain;
+  endPageInput.style.fontSize = "12.5px";
+  endPageInput.style.fontWeight = "600";
+  endPageInput.style.boxSizing = "border-box";
+
+  pageGroup.appendChild(startLabel);
+  pageGroup.appendChild(startPageInput);
+  pageGroup.appendChild(endLabel);
+  pageGroup.appendChild(endPageInput);
+
+  // Checkboxes Group (Both Case Sensitive and Whole Word checked by default)
+  const chkGroup = document.createElement("div");
+  chkGroup.style.display = "flex";
+  chkGroup.style.flexWrap = "wrap";
+  chkGroup.style.alignItems = "center";
+  chkGroup.style.gap = "10px";
+
+  const caseGroup = document.createElement("label");
+  caseGroup.style.display = "flex";
+  caseGroup.style.alignItems = "center";
+  caseGroup.style.gap = "8px";
+  caseGroup.style.padding = "6px 12px";
+  caseGroup.style.borderRadius = "8px";
+  caseGroup.style.backgroundColor = THEME.subtleBg;
+  caseGroup.style.border = `1px solid ${THEME.borderStrong}`;
+  caseGroup.style.fontSize = "12.5px";
+  caseGroup.style.fontWeight = "600";
+  caseGroup.style.color = THEME.textMain;
+  caseGroup.style.cursor = "pointer";
+
+  const chkCaseSensitive = document.createElement("input");
+  chkCaseSensitive.type = "checkbox";
+  chkCaseSensitive.checked = true; // Default: Checked
+  chkCaseSensitive.style.margin = "0";
+  const caseText = document.createElement("div");
+  caseText.textContent = "🔠 Case Sensitive";
+  caseGroup.appendChild(chkCaseSensitive);
+  caseGroup.appendChild(caseText);
+
+  const wordGroup = document.createElement("label");
+  wordGroup.style.display = "flex";
+  wordGroup.style.alignItems = "center";
+  wordGroup.style.gap = "8px";
+  wordGroup.style.padding = "6px 12px";
+  wordGroup.style.borderRadius = "8px";
+  wordGroup.style.backgroundColor = THEME.subtleBg;
+  wordGroup.style.border = `1px solid ${THEME.borderStrong}`;
+  wordGroup.style.fontSize = "12.5px";
+  wordGroup.style.fontWeight = "600";
+  wordGroup.style.color = THEME.textMain;
+  wordGroup.style.cursor = "pointer";
+
+  const chkWholeWord = document.createElement("input");
+  chkWholeWord.type = "checkbox";
+  chkWholeWord.checked = true; // Default: Checked
+  chkWholeWord.style.margin = "0";
+  const wordText = document.createElement("div");
+  wordText.textContent = "🎯 Whole Word";
+  wordGroup.appendChild(chkWholeWord);
+  wordGroup.appendChild(wordText);
+
+  chkGroup.appendChild(caseGroup);
+  chkGroup.appendChild(wordGroup);
+
+  pageAndOptionsRow.appendChild(pageGroup);
+  pageAndOptionsRow.appendChild(chkGroup);
+  filterPanel.appendChild(pageAndOptionsRow);
+
+  scrollBody.appendChild(filterPanel);
+
+  // 2C. Glossary Data Input Panel (With Resizable Textarea Height Controls)
+  const dataPanel = document.createElement("div");
+  dataPanel.style.display = "flex";
+  dataPanel.style.flexDirection = "column";
+  dataPanel.style.gap = "10px";
+  dataPanel.style.padding = "16px 18px";
+  dataPanel.style.backgroundColor = THEME.cardBg;
+  dataPanel.style.border = `1px solid ${THEME.border}`;
+  dataPanel.style.borderRadius = "10px";
+  dataPanel.style.flexShrink = "0";
+
+  const dataHeaderRow = document.createElement("div");
+  dataHeaderRow.style.display = "flex";
+  dataHeaderRow.style.flexWrap = "wrap";
+  dataHeaderRow.style.justifyContent = "space-between";
+  dataHeaderRow.style.alignItems = "center";
+  dataHeaderRow.style.gap = "8px";
+
+  const dataLabel = document.createElement("div");
+  dataLabel.textContent = "📝 Glossary Data (Format: Word | Meaning)";
+  dataLabel.style.fontSize = "13px";
+  dataLabel.style.fontWeight = "700";
+  dataLabel.style.color = THEME.textMain;
+
+  const dataHeaderRight = document.createElement("div");
+  dataHeaderRight.style.display = "flex";
+  dataHeaderRight.style.alignItems = "center";
+  dataHeaderRight.style.gap = "8px";
+
+  const liveParseBadge = document.createElement("div");
+  liveParseBadge.style.fontSize = "11.5px";
+  liveParseBadge.style.fontWeight = "600";
+  liveParseBadge.style.padding = "4px 10px";
+  liveParseBadge.style.borderRadius = "6px";
+
+  dataHeaderRight.appendChild(liveParseBadge);
+  dataHeaderRow.appendChild(dataLabel);
+  dataHeaderRow.appendChild(dataHeaderRight);
+  dataPanel.appendChild(dataHeaderRow);
+
+  const dataInput = document.createElement("textarea");
+  dataInput.value = DEFAULT_SAMPLE_DATA;
+  dataInput.placeholder =
+    "आदर्श पुरुष | उदाहरणीय वा आदर्श व्यक्ति\nअधर्म | अधर्म वा अन्याय । धर्मको विपरीत भाव वा आचरण ।\nआध्यात्मिक विद्या | आध्यात्मिक ज्ञान";
+  dataInput.style.width = "100%";
+  dataInput.style.height = "135px";
+  dataInput.style.padding = "12px 14px";
+  dataInput.style.borderRadius = "8px";
+  dataInput.style.border = `1px solid ${THEME.borderStrong}`;
+  dataInput.style.backgroundColor = THEME.subtleBg;
+  dataInput.style.color = THEME.textMain;
+  dataInput.style.fontSize = "13px";
+  dataInput.style.lineHeight = "1.6";
+  dataInput.style.boxSizing = "border-box";
+  dataPanel.appendChild(dataInput);
+
+  scrollBody.appendChild(dataPanel);
+
+  // 2D. Post-Task Execution Statistics Dashboard Panel (With Expandable Breakdown)
+  const statsDashboard = document.createElement("div");
+  statsDashboard.style.display = "none";
+  statsDashboard.style.flexDirection = "column";
+  statsDashboard.style.gap = "14px";
+  statsDashboard.style.padding = "16px 18px";
+  statsDashboard.style.backgroundColor = THEME.cardBg;
+  statsDashboard.style.border = `1px solid ${THEME.primaryBorder}`;
+  statsDashboard.style.borderRadius = "10px";
+  statsDashboard.style.flexShrink = "0";
+
+  const statsHeaderRow = document.createElement("div");
+  statsHeaderRow.style.display = "flex";
+  statsHeaderRow.style.flexWrap = "wrap";
+  statsHeaderRow.style.justifyContent = "space-between";
+  statsHeaderRow.style.alignItems = "center";
+  statsHeaderRow.style.gap = "10px";
+  statsHeaderRow.style.flexShrink = "0";
+
+  const statsBannerTitle = document.createElement("div");
+  statsBannerTitle.style.fontSize = "14px";
+  statsBannerTitle.style.fontWeight = "700";
+  statsBannerTitle.style.color = THEME.successText;
+
+  const statsHeaderRight = document.createElement("div");
+  statsHeaderRight.style.display = "flex";
+  statsHeaderRight.style.alignItems = "center";
+  statsHeaderRight.style.gap = "10px";
+  statsHeaderRight.style.flexShrink = "0";
+
+  const statsTimeBadge = document.createElement("div");
+  statsTimeBadge.style.fontSize = "11.5px";
+  statsTimeBadge.style.fontWeight = "600";
+  statsTimeBadge.style.padding = "5px 10px";
+  statsTimeBadge.style.borderRadius = "6px";
+  statsTimeBadge.style.backgroundColor = THEME.subtleBg;
+  statsTimeBadge.style.border = `1px solid ${THEME.border}`;
+  statsTimeBadge.style.color = THEME.textSecondary;
+
+  const btnCopyReport = createModernButton({
+    label: "Copy Report",
+    svgPath: SVG_PATHS.copy,
+    bgColor: THEME.subtleBg,
+    hoverBgColor: THEME.border,
+    textColor: THEME.textMain,
+    borderColor: THEME.borderStrong,
+    padding: "5px 12px",
+    fontSize: "11.5px",
+  });
+
+  statsHeaderRight.appendChild(statsTimeBadge);
+  statsHeaderRight.appendChild(btnCopyReport.el);
+  statsHeaderRow.appendChild(statsBannerTitle);
+  statsHeaderRow.appendChild(statsHeaderRight);
+  statsDashboard.appendChild(statsHeaderRow);
+
+  const statsSubMeta = document.createElement("div");
+  statsSubMeta.style.fontSize = "11.5px";
+  statsSubMeta.style.color = THEME.textSecondary;
+  statsSubMeta.style.padding = "8px 12px";
+  statsSubMeta.style.backgroundColor = THEME.subtleBg;
+  statsSubMeta.style.borderRadius = "8px";
+  statsSubMeta.style.border = `1px solid ${THEME.border}`;
+  statsSubMeta.style.flexShrink = "0";
+  statsDashboard.appendChild(statsSubMeta);
+
+  // KPI Metric Cards Row
+  const kpiCardsRow = document.createElement("div");
+  kpiCardsRow.style.display = "flex";
+  kpiCardsRow.style.flexWrap = "wrap";
+  kpiCardsRow.style.gap = "10px";
+  kpiCardsRow.style.flexShrink = "0";
+  statsDashboard.appendChild(kpiCardsRow);
+
+  // Expand / Collapse Toggle Bar for Detailed Breakdown (Defaulted to Collapsed!)
+  const expandToggleRow = document.createElement("div");
+  expandToggleRow.style.display = "flex";
+  expandToggleRow.style.justifyContent = "space-between";
+  expandToggleRow.style.alignItems = "center";
+  expandToggleRow.style.paddingTop = "2px";
+  expandToggleRow.style.flexShrink = "0";
+
+  const btnToggleBreakdown = createModernButton({
+    label: "▼ Show Per-Term Breakdown Details",
+    bgColor: THEME.primarySoft,
+    hoverBgColor: THEME.infoBg,
+    textColor: THEME.primary,
+    borderColor: THEME.primaryBorder,
+    padding: "9px 14px",
+    fontSize: "12px",
+    fontWeight: "700",
+    fullWidth: true,
+  });
+
+  expandToggleRow.appendChild(btnToggleBreakdown.el);
+  statsDashboard.appendChild(expandToggleRow);
+
+  let isBreakdownExpanded = false;
+  let currentBreakdownCount = 0;
+
+  const breakdownContainer = document.createElement("div");
+  breakdownContainer.style.display = "none"; // Default collapsed
+  breakdownContainer.style.flexDirection = "column";
+  breakdownContainer.style.gap = "8px";
+  breakdownContainer.style.maxHeight = "240px";
+  breakdownContainer.style.overflowY = "auto";
+  breakdownContainer.style.padding = "12px";
+  breakdownContainer.style.backgroundColor = THEME.subtleBg;
+  breakdownContainer.style.border = `1px solid ${THEME.borderStrong}`;
+  breakdownContainer.style.borderRadius = "8px";
+  breakdownContainer.style.flexShrink = "0";
+  statsDashboard.appendChild(breakdownContainer);
+
+  function setBreakdownExpanded(expanded) {
+    isBreakdownExpanded = Boolean(expanded);
+    if (isBreakdownExpanded) {
+      breakdownContainer.style.display = "flex";
+      btnToggleBreakdown.setLabel(
+        `▲ Hide Per-Term Breakdown Details (${currentBreakdownCount} items)`
+      );
+      btnToggleBreakdown.setColors(
+        THEME.subtleBg,
+        THEME.border,
+        THEME.textMain,
+        THEME.borderStrong
+      );
+    } else {
+      breakdownContainer.style.display = "none";
+      btnToggleBreakdown.setLabel(
+        `▼ Show Per-Term Breakdown Details (${currentBreakdownCount} items)`
+      );
+      btnToggleBreakdown.setColors(
+        THEME.primarySoft,
+        THEME.infoBg,
+        THEME.primary,
+        THEME.primaryBorder
+      );
+    }
+  }
+
+  btnToggleBreakdown.el.addEventListener("click", () => {
+    setBreakdownExpanded(!isBreakdownExpanded);
+  });
+
+  scrollBody.appendChild(statsDashboard);
+
+  // 2E. Instructions Box inside Scroll Body
+  const instructionsText = document.createElement("div");
+  instructionsText.textContent =
+    "💡 Workflow: 1) Choose Filters & Paste 'Word | Meaning' lines  ➔  2) Click 'Run Indexer'  ➔  3) Click 'Show Per-Term Breakdown Details' to inspect captured pages  ➔  4) Open Window > Type & Tables > Index (Reference mode) & click 'Generate Index'.";
+  instructionsText.style.fontSize = "11.5px";
+  instructionsText.style.lineHeight = "1.55";
+  instructionsText.style.color = THEME.textSecondary;
+  instructionsText.style.backgroundColor = THEME.cardBg;
+  instructionsText.style.border = `1px solid ${THEME.border}`;
+  instructionsText.style.padding = "12px 14px";
+  instructionsText.style.borderRadius = "8px";
+  instructionsText.style.flexShrink = "0";
+  scrollBody.appendChild(instructionsText);
+
+  appShell.appendChild(scrollBody);
+
+  // --- 3. Sticky Action Footer + Drag-to-Resize Corner Grip ---
+  const footerBar = document.createElement("div");
+  footerBar.style.display = "flex";
+  footerBar.style.flexDirection = "column";
+  footerBar.style.gap = "10px";
+  footerBar.style.padding = "14px 24px 12px 24px";
+  footerBar.style.backgroundColor = THEME.cardBg;
+  footerBar.style.borderTop = `1px solid ${THEME.border}`;
+  footerBar.style.flexShrink = "0";
+  footerBar.style.position = "relative";
+
+  const buttonRow = document.createElement("div");
+  buttonRow.style.display = "flex";
+  buttonRow.style.flexWrap = "wrap";
+  buttonRow.style.justifyContent = "space-between";
+  buttonRow.style.alignItems = "center";
+  buttonRow.style.gap = "12px";
+
+  const btnClear = createModernButton({
+    label: "Delete All & Start Fresh",
+    svgPath: SVG_PATHS.trash,
+    bgColor: THEME.dangerBg,
+    hoverBgColor: THEME.dangerHover,
+    textColor: THEME.dangerText,
+    borderColor: THEME.dangerBorder,
+    padding: "9px 16px",
+  });
+
+  const rightBtns = document.createElement("div");
+  rightBtns.style.display = "flex";
+  rightBtns.style.alignItems = "center";
+  rightBtns.style.gap = "10px";
+
+  const btnClose = createModernButton({
+    label: "Close",
+    svgPath: SVG_PATHS.close,
+    bgColor: THEME.subtleBg,
+    hoverBgColor: THEME.border,
+    textColor: THEME.textSecondary,
+    borderColor: THEME.borderStrong,
+    padding: "9px 18px",
+  });
+
+  const btnRun = createModernButton({
+    label: "Run Indexer",
+    svgPath: SVG_PATHS.play,
+    bgColor: THEME.primary,
+    hoverBgColor: THEME.primaryHover,
+    textColor: "#FFFFFF",
+    borderColor: THEME.primary,
+    padding: "9px 22px",
+    fontWeight: "700",
+  });
+
+  rightBtns.appendChild(btnClose.el);
+  rightBtns.appendChild(btnRun.el);
+  buttonRow.appendChild(btnClear.el);
+  buttonRow.appendChild(rightBtns);
+  footerBar.appendChild(buttonRow);
+
+  const footerBottomRow = document.createElement("div");
+  footerBottomRow.style.display = "flex";
+  footerBottomRow.style.justifyContent = "space-between";
+  footerBottomRow.style.alignItems = "center";
+
+  const spacerLeft = document.createElement("div");
+  spacerLeft.style.width = "80px";
+
+  const creditText = document.createElement("div");
+  creditText.textContent = "Made with ❤️ by Rajesh Budhathoki";
+  creditText.style.textAlign = "center";
+  creditText.style.fontSize = "11.5px";
+  creditText.style.fontWeight = "500";
+  creditText.style.color = THEME.textMuted;
+
+  // Interactive Drag-to-Resize Grip in the bottom-right corner
+  const resizeGrip = document.createElement("div");
+  resizeGrip.textContent = "◢ Resize";
+  resizeGrip.title = "Drag to resize window";
+  resizeGrip.style.fontSize = "10.5px";
+  resizeGrip.style.fontWeight = "600";
+  resizeGrip.style.color = THEME.textMuted;
+  resizeGrip.style.cursor = "nwse-resize";
+  resizeGrip.style.userSelect = "none";
+  resizeGrip.style.padding = "2px 6px";
+  resizeGrip.style.borderRadius = "4px";
+  resizeGrip.style.backgroundColor = THEME.subtleBg;
+  resizeGrip.style.border = `1px solid ${THEME.border}`;
+
+  footerBottomRow.appendChild(spacerLeft);
+  footerBottomRow.appendChild(creditText);
+  footerBottomRow.appendChild(resizeGrip);
+  footerBar.appendChild(footerBottomRow);
+
+  appShell.appendChild(footerBar);
+  dialog.appendChild(appShell);
+  document.body.appendChild(dialog);
+
+  // --- Window Size Preset & Drag-to-Resize Logic ---
+  btnWindowSize.el.addEventListener("click", () => {
+    currentPresetIdx = (currentPresetIdx + 1) % WINDOW_PRESETS.length;
+    const preset = WINDOW_PRESETS[currentPresetIdx];
+    dialog.style.width = `${preset.w}px`;
+    dialog.style.height = `${preset.h}px`;
+    dataInput.style.height = `${preset.textareaH}px`;
+    btnWindowSize.setLabel(`Size: ${preset.name}`);
+  });
+
+  let isResizing = false;
+  let startX = 0;
+  let startY = 0;
+  let startW = 760;
+  let startH = 680;
+
+  resizeGrip.addEventListener("mousedown", (e) => {
+    isResizing = true;
+    startX = e.clientX;
+    startY = e.clientY;
+    startW = parseInt(dialog.style.width, 10) || 760;
+    startH = parseInt(dialog.style.height, 10) || 680;
+    e.preventDefault();
+  });
+
+  dialog.addEventListener("mousemove", (e) => {
+    if (!isResizing) return;
+    const newW = Math.max(560, Math.min(1150, startW + (e.clientX - startX)));
+    const newH = Math.max(480, Math.min(920, startH + (e.clientY - startY)));
+    dialog.style.width = `${newW}px`;
+    dialog.style.height = `${newH}px`;
+  });
+
+  dialog.addEventListener("mouseup", () => {
+    isResizing = false;
+  });
+
+  // --- Helper Functions to Refresh UI Stats ---
+  let latestReportText = "";
+
+  function refreshTopBarStats() {
+    const docStats = getDocumentIndexStats(doc);
+    const parsed = parseGlossaryInput(dataInput.value);
+
+    statDocPages.valEl.textContent = String(pagesArr.length);
+    statDocTopics.valEl.textContent = String(docStats.totalTopics);
+    statDocRefs.valEl.textContent = String(docStats.totalPageRefs);
+    statInputValid.valEl.textContent = String(parsed.validItems.length);
+
+    if (parsed.invalidLines > 0) {
+      liveParseBadge.textContent = `⚠️ ${parsed.validItems.length} valid  |  ${parsed.invalidLines} missing '|'`;
+      liveParseBadge.style.backgroundColor = THEME.warnBg;
+      liveParseBadge.style.color = THEME.warnText;
+      liveParseBadge.style.border = `1px solid ${THEME.warnBorder}`;
+    } else {
+      liveParseBadge.textContent = `✨ ${parsed.validItems.length} valid entries ready`;
+      liveParseBadge.style.backgroundColor = THEME.successBg;
+      liveParseBadge.style.color = THEME.successText;
+      liveParseBadge.style.border = `1px solid ${THEME.successBorder}`;
+    }
+  }
+
+  function renderKpiCard(icon, title, value, textColor, bgColor, borderColor) {
+    const card = document.createElement("div");
+    card.style.display = "flex";
+    card.style.flexDirection = "column";
+    card.style.flex = "1 1 102px";
+    card.style.minWidth = "100px";
+    card.style.padding = "10px 12px";
+    card.style.backgroundColor = bgColor || THEME.appBg;
+    card.style.border = `1px solid ${borderColor || THEME.border}`;
+    card.style.borderRadius = "8px";
+    card.style.boxSizing = "border-box";
+    card.style.flexShrink = "0";
+
+    const v = document.createElement("div");
+    v.textContent = `${icon} ${value}`;
+    v.style.fontSize = "15px";
+    v.style.fontWeight = "700";
+    v.style.color = textColor || THEME.textMain;
+
+    const t = document.createElement("div");
+    t.textContent = title;
+    t.style.fontSize = "11px";
+    t.style.fontWeight = "600";
+    t.style.color = THEME.textSecondary;
+    t.style.marginTop = "4px";
+
+    card.appendChild(v);
+    card.appendChild(t);
+    return card;
+  }
+
+  function renderRunStatsOnUI(
+    stats,
+    styleUsedString,
+    startPageName,
+    endPageName,
+    isCase,
+    isWhole
+  ) {
+    statsDashboard.style.display = "flex";
+    const sec = (stats.durationMs / 1000).toFixed(2);
+    const matchedCount = stats.totalTerms - stats.unmatchedTerms.length;
+
+    statsBannerTitle.textContent = `✅ Indexing Complete (${matchedCount}/${stats.totalTerms} Terms Matched)`;
+    statsBannerTitle.style.color =
+      stats.unmatchedTerms.length === 0 ? THEME.successText : THEME.warnText;
+    statsTimeBadge.textContent = `⏱️ ${sec}s (${stats.durationMs} ms)`;
+
+    statsSubMeta.textContent =
+      `¶ Style: ${styleUsedString}   •   📖 Pages: ${startPageName} to ${endPageName}   •   ` +
+      `🔠 Case Sensitive: ${isCase ? "Yes" : "No"}   •   🎯 Whole Word: ${isWhole ? "Yes" : "No"}`;
+
+    kpiCardsRow.innerHTML = "";
+    kpiCardsRow.appendChild(
+      renderKpiCard(
+        "📦",
+        "Terms Processed",
+        stats.totalTerms,
+        THEME.infoText,
+        THEME.infoBg,
+        THEME.infoBorder
+      )
+    );
+    kpiCardsRow.appendChild(
+      renderKpiCard(
+        "✨",
+        "New Topics",
+        stats.newTopicsAdded,
+        THEME.successText,
+        THEME.successBg,
+        THEME.successBorder
+      )
+    );
+    kpiCardsRow.appendChild(
+      renderKpiCard(
+        "🔄",
+        "Updated Topics",
+        stats.existingTopicsUpdated,
+        "#0369A1",
+        "#E0F2FE",
+        "#7DD3FC"
+      )
+    );
+    kpiCardsRow.appendChild(
+      renderKpiCard(
+        "🔖",
+        "Page Refs Added",
+        stats.newRefsAdded,
+        THEME.warnText,
+        THEME.warnBg,
+        THEME.warnBorder
+      )
+    );
+    kpiCardsRow.appendChild(
+      renderKpiCard(
+        "🛡️",
+        "Same-Page Deduped",
+        stats.duplicatesSkipped,
+        "#6D28D9",
+        "#F3E8FF",
+        "#DDD6FE"
+      )
+    );
+    kpiCardsRow.appendChild(
+      renderKpiCard(
+        stats.unmatchedTerms.length > 0 ? "⚠️" : "✅",
+        "Not Found",
+        stats.unmatchedTerms.length,
+        stats.unmatchedTerms.length > 0 ? THEME.dangerText : THEME.successText,
+        stats.unmatchedTerms.length > 0 ? THEME.dangerBg : THEME.successBg,
+        stats.unmatchedTerms.length > 0
+          ? THEME.dangerBorder
+          : THEME.successBorder
+      )
+    );
+
+    breakdownContainer.innerHTML = "";
+    currentBreakdownCount = stats.termDetails.length;
+
+    for (let i = 0; i < stats.termDetails.length; i++) {
+      const item = stats.termDetails[i];
+
+      const row = document.createElement("div");
+      row.style.display = "flex";
+      row.style.flexDirection = "row";
+      row.style.flexWrap = "wrap";
+      row.style.justifyContent = "space-between";
+      row.style.alignItems = "center";
+      row.style.gap = "10px";
+      row.style.padding = "10px 12px";
+      row.style.borderRadius = "8px";
+      row.style.backgroundColor = THEME.cardBg;
+      row.style.border = `1px solid ${THEME.border}`;
+      row.style.flexShrink = "0";
+
+      const leftCol = document.createElement("div");
+      leftCol.style.display = "flex";
+      leftCol.style.flexDirection = "row";
+      leftCol.style.alignItems = "center";
+      leftCol.style.gap = "10px";
+      leftCol.style.flex = "1 1 260px";
+      leftCol.style.minWidth = "0";
+
+      const statusBadge = document.createElement("div");
+      statusBadge.style.fontSize = "10.5px";
+      statusBadge.style.fontWeight = "700";
+      statusBadge.style.padding = "4px 8px";
+      statusBadge.style.borderRadius = "6px";
+      statusBadge.style.flexShrink = "0";
+
+      if (item.status === "NEW") {
+        statusBadge.textContent = "✨ NEW";
+        statusBadge.style.backgroundColor = THEME.successBg;
+        statusBadge.style.color = THEME.successText;
+        statusBadge.style.border = `1px solid ${THEME.successBorder}`;
+      } else if (item.status === "UPDATED") {
+        statusBadge.textContent = "🔄 UPDATED";
+        statusBadge.style.backgroundColor = THEME.infoBg;
+        statusBadge.style.color = THEME.infoText;
+        statusBadge.style.border = `1px solid ${THEME.infoBorder}`;
+      } else if (item.status === "EXISTS") {
+        statusBadge.textContent = "✅ EXISTS";
+        statusBadge.style.backgroundColor = THEME.neutralBg;
+        statusBadge.style.color = THEME.neutralText;
+        statusBadge.style.border = `1px solid ${THEME.neutralBorder}`;
+      } else {
+        statusBadge.textContent = "⚠️ NOT FOUND";
+        statusBadge.style.backgroundColor = THEME.dangerBg;
+        statusBadge.style.color = THEME.dangerText;
+        statusBadge.style.border = `1px solid ${THEME.dangerBorder}`;
+      }
+
+      const termTextCol = document.createElement("div");
+      termTextCol.style.display = "flex";
+      termTextCol.style.flexDirection = "column";
+      termTextCol.style.gap = "2px";
+      termTextCol.style.flex = "1";
+      termTextCol.style.minWidth = "0";
+
+      const wordDiv = document.createElement("div");
+      wordDiv.textContent = item.word || "(Empty Term)";
+      wordDiv.style.color = THEME.textMain;
+      wordDiv.style.fontSize = "13px";
+      wordDiv.style.fontWeight = "700";
+      wordDiv.style.lineHeight = "1.35";
+
+      const meaningDiv = document.createElement("div");
+      meaningDiv.textContent = item.meaning || "";
+      meaningDiv.style.color = THEME.textMuted;
+      meaningDiv.style.fontSize = "11.5px";
+      meaningDiv.style.lineHeight = "1.35";
+
+      termTextCol.appendChild(wordDiv);
+      if (item.meaning) {
+        termTextCol.appendChild(meaningDiv);
+      }
+
+      leftCol.appendChild(statusBadge);
+      leftCol.appendChild(termTextCol);
+
+      const rightCol = document.createElement("div");
+      rightCol.style.fontSize = "11.5px";
+      rightCol.style.fontWeight = "600";
+      rightCol.style.padding = "5px 10px";
+      rightCol.style.borderRadius = "6px";
+      rightCol.style.flexShrink = "0";
+
+      if (item.pages && item.pages.length > 0) {
+        const dedupNote =
+          item.duplicatesSkipped > 0
+            ? ` (+${item.duplicatesSkipped} dup skipped)`
+            : "";
+        rightCol.textContent = `📄 Pages: ${item.pages.join(", ")}${dedupNote}`;
+        rightCol.style.backgroundColor = THEME.primarySoft;
+        rightCol.style.color = THEME.primary;
+        rightCol.style.border = `1px solid ${THEME.primaryBorder}`;
+      } else {
+        rightCol.textContent =
+          item.outOfRange > 0
+            ? `⚠️ 0 in range (${item.outOfRange} outside)`
+            : "0 matches";
+        rightCol.style.backgroundColor = THEME.dangerBg;
+        rightCol.style.color = THEME.dangerText;
+        rightCol.style.border = `1px solid ${THEME.dangerBorder}`;
+      }
+
+      row.appendChild(leftCol);
+      row.appendChild(rightCol);
+      breakdownContainer.appendChild(row);
+    }
+
+    expandToggleRow.style.display = "flex";
+    setBreakdownExpanded(false);
+
+    const reportLines = [
+      "=== InDesign Glossary Indexer Report ===",
+      `Document: ${doc.name}`,
+      `Style: ${styleUsedString} | Page Range: ${startPageName} to ${endPageName}`,
+      `Case Sensitive: ${isCase ? "Yes" : "No"} | Whole Word: ${isWhole ? "Yes" : "No"}`,
+      `Duration: ${sec}s`,
+      `Processed: ${stats.totalTerms} | New Topics: ${stats.newTopicsAdded} | Updated: ${stats.existingTopicsUpdated}`,
+      `Unique Page Refs Added: ${stats.newRefsAdded} | Same-Page Duplicates Skipped: ${stats.duplicatesSkipped}`,
+      "",
+      "--- Per-Term Breakdown ---",
+    ];
+    for (let i = 0; i < stats.termDetails.length; i++) {
+      const d = stats.termDetails[i];
+      reportLines.push(
+        `[${d.status}] ${d.word} -> ${
+          d.pages.length > 0 ? "Pages: " + d.pages.join(", ") : "Not Found"
+        } (Raw hits: ${d.rawMatches}, Deduped: ${d.duplicatesSkipped})`
+      );
+    }
+    latestReportText = reportLines.join("\n");
+
+    refreshTopBarStats();
+  }
+
+  function renderDeleteStatsOnUI(delStats) {
+    statsDashboard.style.display = "flex";
+    const sec = (delStats.durationMs / 1000).toFixed(2);
+
+    statsBannerTitle.textContent = "✅ All Index Data & Markers Cleared";
+    statsBannerTitle.style.color = THEME.dangerText;
+    statsTimeBadge.textContent = `⏱️ ${sec}s (${delStats.durationMs} ms)`;
+    statsSubMeta.textContent =
+      "Both Reference and Topic tabs in the Index panel are now empty and ready for fresh indexing.";
+
+    kpiCardsRow.innerHTML = "";
+    kpiCardsRow.appendChild(
+      renderKpiCard(
+        "🏷️",
+        "Topics Removed",
+        delStats.removedTopics,
+        THEME.dangerText,
+        THEME.dangerBg,
+        THEME.dangerBorder
+      )
+    );
+    kpiCardsRow.appendChild(
+      renderKpiCard(
+        "🔖",
+        "Page Refs Removed",
+        delStats.removedPageRefs,
+        THEME.warnText,
+        THEME.warnBg,
+        THEME.warnBorder
+      )
+    );
+    kpiCardsRow.appendChild(
+      renderKpiCard(
+        "✨",
+        "~I Markers Stripped",
+        delStats.removedMarkers,
+        "#6D28D9",
+        "#F3E8FF",
+        "#DDD6FE"
+      )
+    );
+
+    breakdownContainer.innerHTML = "";
+    currentBreakdownCount = 0;
+    expandToggleRow.style.display = "none";
+    breakdownContainer.style.display = "none";
+
+    latestReportText =
+      `=== Index Cleared ===\nTopics Removed: ${delStats.removedTopics}\n` +
+      `Page Refs Removed: ${delStats.removedPageRefs}\n~I Markers Stripped: ${delStats.removedMarkers}`;
+
+    refreshTopBarStats();
+  }
+
+  // Initialize live stats bar on open and on textarea input
+  refreshTopBarStats();
+  dataInput.addEventListener("input", refreshTopBarStats);
+
+  // Copy Report Handler
+  btnCopyReport.el.addEventListener("click", async () => {
+    if (!latestReportText) return;
+    try {
+      if (navigator && navigator.clipboard && navigator.clipboard.writeText) {
+        await navigator.clipboard.writeText(latestReportText);
+        btnCopyReport.setLabel("Copied!");
+        setTimeout(() => {
+          btnCopyReport.setLabel("Copy Report");
+        }, 1500);
+        return;
+      }
+    } catch (e) {}
+    await showAlertDialog("Indexing Report", latestReportText, dialog);
+  });
+
+  // Delete All & Start Fresh Handler
+  btnClear.el.addEventListener("click", async () => {
+    const confirmed = await showConfirmDialog(
+      "Delete All Index Data?",
+      "WARNING: This will DELETE ALL previous index topics, page references, and ~I markers from the document and Index panel.\n\nContinue and start fresh?",
+      dialog
+    );
+    if (confirmed) {
+      const delStats = clearAllIndexData();
+      renderDeleteStatsOnUI(delStats);
+    }
+  });
+
+  // Run Indexer Handler
+  btnRun.el.addEventListener("click", async () => {
+    const parsed = parseGlossaryInput(dataInput.value);
+
+    if (parsed.totalNonEmptyLines === 0) {
+      await showAlertDialog(
+        "No Data Provided",
+        "Please paste at least one 'Word | Meaning' line into the Glossary Data box.",
+        dialog
+      );
+      return;
+    }
+
+    if (parsed.validItems.length === 0) {
+      await showAlertDialog(
+        "Invalid Format",
+        "No valid lines found. Ensure each line uses the 'Word | Meaning' format separated by a pipe (|).",
+        dialog
+      );
+      return;
+    }
+
+    const selectedStyleIdx = Number(styleSelect.selectedIndex) || 0;
+    const selectedStyle =
+      selectedStyleIdx === 0 ? null : allStyles[selectedStyleIdx - 1] || null;
+
+    const startPageName =
+      (startPageInput.value || "").trim() !== ""
+        ? startPageInput.value.trim()
+        : firstPageName;
+    const endPageName =
+      (endPageInput.value || "").trim() !== ""
+        ? endPageInput.value.trim()
+        : lastPageName;
+
+    const isCaseSensitive = Boolean(chkCaseSensitive.checked);
+    const isWholeWord = Boolean(chkWholeWord.checked);
+
+    btnRun.setLabel("Indexing...");
+    btnRun.setDisabled(true);
+
+    let prevRedraw = true;
+    try {
+      prevRedraw = app.scriptPreferences.enableRedraw;
+      app.scriptPreferences.enableRedraw = false;
+    } catch (e) {}
+
+    let runStats = null;
+    try {
+      runWithUndo(() => {
+        runStats = runCoreIndexer(
+          parsed.validItems,
+          selectedStyle,
+          startPageName,
+          endPageName,
+          isCaseSensitive,
+          isWholeWord
+        );
+      }, "Auto Index with Page Refs");
+    } finally {
+      try {
+        app.scriptPreferences.enableRedraw = prevRedraw;
+      } catch (e) {}
+      btnRun.setLabel("Run Indexer");
+      btnRun.setDisabled(false);
+    }
+
+    if (runStats) {
+      const styleUsedString =
+        selectedStyle !== null ? selectedStyle.name : "[Any Style]";
+      renderRunStatsOnUI(
+        runStats,
+        styleUsedString,
+        startPageName,
+        endPageName,
+        isCaseSensitive,
+        isWholeWord
+      );
+    }
+  });
+
+  // Keep Dialog Open Until User Clicks "Close" or Escapes
+  await new Promise((resolve) => {
+    let closed = false;
+    const closeMainDialog = () => {
+      if (closed) return;
+      closed = true;
+      try {
+        dialog.close();
+      } catch (e) {}
+      try {
+        dialog.remove();
+      } catch (e) {}
+      resolve();
+    };
+
+    btnClose.el.addEventListener("click", closeMainDialog);
+    dialog.addEventListener("cancel", closeMainDialog);
+    dialog.showModal();
+  });
+}
+
+await main();
